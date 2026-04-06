@@ -755,38 +755,53 @@ def merge_payroll(df_wages, driver_info_df, payroll_df):
     if payroll_df is None or payroll_df.empty:
         return df_wages
 
-    # 운전자 → 사원번호 매핑
-    if driver_info_df is not None and '사원번호' in driver_info_df.columns:
-        info = driver_info_df.copy()
-        info.columns = [c.strip() for c in info.columns]
-        dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
-        info = info.rename(columns={dcol: '운전자'})
-        info['사원번호'] = info['사원번호'].astype(str).str.strip().str.zfill(7)
-        df = df_wages.merge(info[['운전자','사원번호']], on='운전자', how='left')
-    else:
-        return df_wages  # 사원번호 없으면 스킵
+    df = df_wages.copy()
 
-    # 급여명세서 월별 집계 (사원번호+연도+월)
-    pay_agg = payroll_df.groupby(['사원번호','연도','월']).agg(
-        P_기본급=('기본급','sum'),
-        P_연장근로=('연장근로','sum'),
-        P_야간오전=('야간오전','sum'),
-        P_야간오후=('야간오후','sum'),
-        P_주휴수당=('주휴수당','sum'),
-        P_휴일오전=('휴일오전','sum'),
-        P_휴일오후=('휴일오후','sum'),
-        P_경축수당=('경축수당','sum'),
-        P_지급총액=('지급총액_명세','sum'),
-    ).reset_index()
+    # 사원번호가 아직 없으면 driver_info에서 가져오기
+    if '사원번호' not in df.columns:
+        if driver_info_df is not None:
+            info = driver_info_df.copy()
+            info.columns = [c.strip() for c in info.columns]
+            dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
+            info = info.rename(columns={dcol: '운전자'})
+            if '사원번호' in info.columns:
+                info['사원번호'] = info['사원번호'].astype(str).str.strip().str.zfill(7)
+                df = df.merge(info[['운전자','사원번호']], on='운전자', how='left')
+            else:
+                return df_wages  # 사원번호 정보 없음
+        else:
+            return df_wages
+
+    # 사원번호 형식 통일
+    df['사원번호'] = df['사원번호'].astype(str).str.strip().str.zfill(7)
+
+    # 급여명세서 월별 집계
+    pay_cols_avail = {
+        'P_기본급':   '기본급',   'P_연장근로': '연장근로',
+        'P_야간오전': '야간오전', 'P_야간오후': '야간오후',
+        'P_주휴수당': '주휴수당', 'P_휴일오전': '휴일오전',
+        'P_휴일오후': '휴일오후', 'P_경축수당': '경축수당',
+        'P_지급총액': '지급총액_명세',
+    }
+    agg_dict = {k: (v, 'sum') for k, v in pay_cols_avail.items()
+                if v in payroll_df.columns}
+    if not agg_dict:
+        return df
+
+    pay_agg = payroll_df.groupby(['사원번호','연도','월']).agg(**agg_dict).reset_index()
+    pay_agg['사원번호'] = pay_agg['사원번호'].astype(str).str.strip().str.zfill(7)
 
     df = df.merge(pay_agg, on=['사원번호','연도','월'], how='left')
 
-    # 급여 항목 대응 합계
-    df['P_기지급_합계'] = df[['P_기본급','P_연장근로','P_야간오전','P_야간오후',
-                               'P_주휴수당','P_휴일오전','P_휴일오후','P_경축수당']].sum(axis=1)
+    # 기지급 합계
+    p_cols = [c for c in ['P_기본급','P_연장근로','P_야간오전','P_야간오후',
+                           'P_주휴수당','P_휴일오전','P_휴일오후','P_경축수당']
+              if c in df.columns]
+    df['P_기지급_합계'] = df[p_cols].fillna(0).sum(axis=1)
 
     # 차액 = 재산정합계 - 기지급합계
-    df['차액'] = df['재산정_합계'] - df['P_기지급_합계']
+    if '재산정_합계' in df.columns:
+        df['차액'] = df['재산정_합계'] - df['P_기지급_합계']
     return df
 
 
