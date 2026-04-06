@@ -456,7 +456,7 @@ def calc_night_minutes(start_m, trip_mins):
     return float(max(0, night))
 
 
-def classify_work_hours(df_proc, driver_hol_df):
+def classify_work_hours(df_proc, driver_hol_df, driver_info_df=None):
     """
     처리된 운행 데이터 → 일별 근로시간 6분류
     A 평일8h기준 / B 평일9h월상계 / C 야간 / D 쉬프트단축 / E 휴일8h / F 휴일8h초과
@@ -478,15 +478,32 @@ def classify_work_hours(df_proc, driver_hol_df):
     pub_hol_set = set(KOREAN_HOLIDAYS.keys())
 
     # ─ 운전자별 지정휴일 요일 dict ─
+    # 우선순위: ③ 지정휴일CSV > ⑤ 운전자정보CSV > 없으면 빈dict
     hol_lookup = {}
-    if driver_hol_df is not None and not driver_hol_df.empty:
-        hdf = driver_hol_df.copy()
+
+    def build_hol_lookup(src_df):
+        if src_df is None or src_df.empty: return {}
+        hdf = src_df.copy()
         hdf.columns = [c.strip() for c in hdf.columns]
+        if "지정휴일1" not in hdf.columns and "지정휴일2" not in hdf.columns:
+            return {}
         dcol = next((c for c in ["운전자","이름","성명","name"] if c in hdf.columns), hdf.columns[0])
         hdf = hdf.rename(columns={dcol: "운전자"})
+        lookup = {}
         for _, row in hdf.iterrows():
             d = str(row["운전자"]).strip()
-            hol_lookup[d] = {int(row.get("지정휴일1", 5)), int(row.get("지정휴일2", 6))}
+            h1 = row.get("지정휴일1", 5)
+            h2 = row.get("지정휴일2", 6)
+            # 숫자 또는 한글 요일 모두 처리
+            wmap = {"월":0,"화":1,"수":2,"목":3,"금":4,"토":5,"일":6}
+            h1 = wmap.get(str(h1), int(h1)) if str(h1) in wmap else (int(h1) if str(h1).isdigit() else 5)
+            h2 = wmap.get(str(h2), int(h2)) if str(h2) in wmap else (int(h2) if str(h2).isdigit() else 6)
+            lookup[d] = {int(h1), int(h2)}
+        return lookup
+
+    hol_lookup = build_hol_lookup(driver_hol_df)
+    if not hol_lookup:
+        hol_lookup = build_hol_lookup(driver_info_df)
 
     def is_holiday(driver, dt):
         d = dt.date() if hasattr(dt, "date") else dt
@@ -1387,7 +1404,7 @@ with tab_labor:
     st.caption("임금협정 기준(9h/5h) 대비 실제 운행시간 기반 재산정 | 통상임금 소송용")
 
     with st.spinner("근로시간 6분류 계산 중..."):
-        df_cls = classify_work_hours(df_proc, driver_hol_df)
+        df_cls = classify_work_hours(df_proc, driver_hol_df, driver_info_df)
         df_monthly_labor = monthly_work_summary(df_cls)
 
     # ── 필터 ──
@@ -1411,8 +1428,13 @@ with tab_labor:
     k3.metric("휴일 근무일수",   f'{filt_cls["휴일여부"].sum():,}일')
     k4.metric("야간 총시간",     f'{filt_cls["C_야간"].sum()/60:.1f}h')
     k5.metric("9h 초과(월계)",   f'{filt_mo["B_평일9h상계_시간"].sum():.1f}h' if not filt_mo.empty else "─")
-    if driver_hol_df is None:
-        st.info("💡 **지정휴일 CSV 미업로드**: 법정공휴일만 휴일로 분류합니다. 운전자별 지정휴일(주 2일)을 반영하려면 ③ 지정휴일 파일을 업로드하세요.")
+    hol_source = "③ 지정휴일CSV" if (driver_hol_df is not None) else                  ("⑤ 운전자정보CSV" if (driver_info_df is not None and
+                  any(c in (driver_info_df.columns if driver_info_df is not None else [])
+                      for c in ["지정휴일1","지정휴일2"])) else "없음")
+    if hol_source == "없음":
+        st.warning("⚠️ 지정휴일 정보 없음: 법정공휴일만 휴일 분류됩니다. ③ 지정휴일CSV 또는 ⑤ 운전자정보CSV에 '지정휴일1','지정휴일2' 컬럼을 추가하세요.")
+    else:
+        st.success(f"✅ 지정휴일 적용 중 ({hol_source})")
 
     st.markdown("---")
 
