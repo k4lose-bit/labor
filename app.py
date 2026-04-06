@@ -904,7 +904,7 @@ with tab_labor:
         return ""
     st.dataframe(
         show_daily.sort_values(["운전자","날짜"]).reset_index(drop=True)
-                  .style.applymap(highlight_neg,
+                  .style.map(highlight_neg,
                     subset=["B.평일9h상계","D.쉬프트단축"]),
         use_container_width=True, hide_index=True
     )
@@ -927,7 +927,7 @@ with tab_labor:
     ]
     st.dataframe(
         show_mo.sort_values("운전자").reset_index(drop=True)
-               .style.applymap(highlight_neg, subset=["B.평일9h상계","D.쉬프트단축"]),
+               .style.map(highlight_neg, subset=["B.평일9h상계","D.쉬프트단축"]),
         use_container_width=True, hide_index=True
     )
 
