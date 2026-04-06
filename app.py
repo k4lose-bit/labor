@@ -24,6 +24,29 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ── 브라우저 자동번역 차단 (Chrome / 네이버 웨일 번역 충돌 방지) ──
+st.markdown("""
+<meta name="google" content="notranslate">
+<style>
+  .goog-te-banner-frame { display: none !important; }
+  body { top: 0 !important; }
+</style>
+<script>
+  document.documentElement.lang = 'ko';
+  document.documentElement.translate = false;
+  window.addEventListener('DOMContentLoaded', function() {
+    var meta = document.createElement('meta');
+    meta.name = 'google';
+    meta.content = 'notranslate';
+    document.head.appendChild(meta);
+    var meta2 = document.createElement('meta');
+    meta2.httpEquiv = 'Content-Language';
+    meta2.content = 'ko';
+    document.head.appendChild(meta2);
+  });
+</script>
+""", unsafe_allow_html=True)
+
 # ============================================================
 # 한국 공휴일 (공휴일에 관한 규정 / 대체공휴일 포함)
 # 2020 ~ 2025
