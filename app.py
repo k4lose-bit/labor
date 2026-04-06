@@ -490,9 +490,12 @@ def classify_work_hours(df_proc, driver_hol_df):
 
     def is_holiday(driver, dt):
         d = dt.date() if hasattr(dt, "date") else dt
+        # 법정공휴일 → 항상 휴일
         if d in pub_hol_set:
             return True
-        if driver in hol_lookup and dt.weekday() in hol_lookup[driver]:
+        # 지정휴일 CSV가 있을 때만 개인별 지정휴일 적용
+        # (없으면 토/일도 휴일 아님 → 운행데이터 기반 실제 근무만 판단)
+        if hol_lookup and driver in hol_lookup and dt.weekday() in hol_lookup[driver]:
             return True
         return False
 
@@ -565,6 +568,8 @@ def monthly_work_summary(df_cls):
         E_휴일8h_분=("E_휴일8h", "sum"),
         F_휴일8h초과_분=("F_휴일8h초과", "sum"),
         G_휴일상계_분=("G_휴일상계", "sum"),
+        W_E_휴일8h_합=("E_휴일8h", "sum"),
+        W_F_휴일8h초과_합=("F_휴일8h초과", "sum"),
     ).reset_index()
 
     for col in ["A_평일8h", "B_평일9h상계", "C_야간", "C_야간상계", "D_쉬프트단축", "E_휴일실제", "E_휴일8h", "F_휴일8h초과", "G_휴일상계"]:
@@ -799,7 +804,19 @@ def merge_payroll(df_wages, driver_info_df, payroll_df):
               if c in df.columns]
     df['P_기지급_합계'] = df[p_cols].fillna(0).sum(axis=1)
 
-    # 차액 = 재산정합계 - 기지급합계
+    # 휴일 임금 상계: 재산정 휴일임금 - 기지급 휴일임금
+    if '통상시급' in df.columns:
+        ts = df['통상시급'].fillna(0)
+        # 재산정 휴일임금 (E×1.5 + F×2.0)
+        e_min = df.get('W_E_휴일8h_합', df.get('E_휴일8h_분', pd.Series(0, index=df.index)))
+        f_min = df.get('W_F_휴일8h초과_합', df.get('F_휴일8h초과_분', pd.Series(0, index=df.index)))
+        df['H_휴일재산정임금'] = ((e_min.fillna(0)/60*ts*1.5) + (f_min.fillna(0)/60*ts*2.0)).round().astype(int)
+        # 기지급 휴일임금
+        p_hol_cols = [c for c in ['P_휴일오전','P_휴일오후'] if c in df.columns]
+        df['H_휴일기지급임금'] = df[p_hol_cols].fillna(0).sum(axis=1).astype(int) if p_hol_cols else 0
+        df['H_휴일차액'] = df['H_휴일재산정임금'] - df['H_휴일기지급임금']
+
+    # 전체 차액 = 재산정합계 - 기지급합계
     if '재산정_합계' in df.columns:
         df['차액'] = df['재산정_합계'] - df['P_기지급_합계']
     return df
@@ -953,11 +970,23 @@ def generate_report_excel(df_with_wages, df_proc_detail):
                 set_cell(ws, row_num, 2, yr_val, font=normal, align=center, border=border)
                 set_cell(ws, row_num, 3, month, font=normal, align=center, border=border)
 
-                # 시간 컬럼 (분 → Excel 시간값 = 분/60/24)
+                # 시간 컬럼 (음수=텍스트, 양수=Excel 시간값)
                 for col, mins in [(4, A_min),(5, B_min),(6, C_min),(7, D_min),
                                    (9, E_min),(10, F_min)]:
-                    val = mins / 60.0 / 24.0  # Excel time fraction
-                    c = set_cell(ws, row_num, col, val, font=normal,
+                    if mins < 0:
+                        # 음수 시간은 Excel이 표시 못함 → 텍스트로 저장
+                        h = int(abs(mins) // 60)
+                        m = int(abs(mins) % 60)
+                        txt_val = f"-{h:02d}:{m:02d}"
+                        neg_font = Font(name='맑은 고딕', size=9, color='FF0000')
+                        set_cell(ws, row_num, col, txt_val, font=neg_font,
+                                 align=center, border=border)
+                    elif mins == 0:
+                        set_cell(ws, row_num, col, '00:00', font=normal,
+                                 align=center, border=border)
+                    else:
+                        val = mins / 60.0 / 24.0
+                        set_cell(ws, row_num, col, val, font=normal,
                                  align=center, border=border, num_format=time_fmt)
 
                 # 급여 컬럼
@@ -1382,6 +1411,8 @@ with tab_labor:
     k3.metric("휴일 근무일수",   f'{filt_cls["휴일여부"].sum():,}일')
     k4.metric("야간 총시간",     f'{filt_cls["C_야간"].sum()/60:.1f}h')
     k5.metric("9h 초과(월계)",   f'{filt_mo["B_평일9h상계_시간"].sum():.1f}h' if not filt_mo.empty else "─")
+    if driver_hol_df is None:
+        st.info("💡 **지정휴일 CSV 미업로드**: 법정공휴일만 휴일로 분류합니다. 운전자별 지정휴일(주 2일)을 반영하려면 ③ 지정휴일 파일을 업로드하세요.")
 
     st.markdown("---")
 
