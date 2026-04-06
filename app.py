@@ -473,10 +473,18 @@ if uploaded_route:
 driver_hol_df = None
 if uploaded_hol:
     raw = uploaded_hol.read()
-    if raw.startswith(b'\xef\xbb\xbf'):  # BOM 수동 제거 (Python 3.14 utf-8-sig 버그 우회)
+    if raw.startswith(b'\xef\xbb\xbf'):
         raw = raw[3:]
-    hol = pd.read_csv(io.StringIO(raw.decode("utf-8")))
-    # 요일명 → 숫자
+    hol = None
+    for enc in ["utf-8", "cp949", "euc-kr", "latin-1"]:
+        try:
+            hol = pd.read_csv(io.StringIO(raw.decode(enc)))
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    if hol is None:
+        st.error("지정휴일 파일 인코딩 오류. UTF-8 또는 CP949로 저장 후 다시 업로드하세요.")
+        st.stop()
     if "지정휴일1" in hol.columns:
         hol["지정휴일1"] = hol["지정휴일1"].map(WEEKDAY_MAP).fillna(5).astype(int)
     if "지정휴일2" in hol.columns:
