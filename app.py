@@ -442,6 +442,124 @@ def monthly_attendance(df_daily, driver_hol_df, year, month):
     return result
 
 
+
+def calc_night_minutes(start_m, trip_mins):
+    """회차별 야간(22:00~06:00) 겹치는 시간(분) 계산"""
+    if start_m is None or np.isnan(start_m): return 0.0
+    end_m = start_m + trip_mins
+    night  = max(0, min(end_m, 360)  - max(start_m, 0))      # 00:00~06:00
+    night += max(0, min(end_m, 1440) - max(start_m, 1320))    # 22:00~24:00
+    night += max(0, min(end_m, 1800) - max(start_m, 1440))    # 다음날 00:00~06:00
+    return float(max(0, night))
+
+
+def classify_work_hours(df_proc, driver_hol_df):
+    """
+    처리된 운행 데이터 → 일별 근로시간 6분류
+    A 평일8h기준 / B 평일9h월상계 / C 야간 / D 쉬프트단축 / E 휴일8h / F 휴일8h초과
+    """
+    df = df_proc.copy()
+
+    # ─ 회차별 야간 시간 ─
+    df["야간_분"] = df.apply(
+        lambda r: calc_night_minutes(r["출발분"], r["보정운행시간"]), axis=1
+    )
+
+    # ─ 일별 집계 ─
+    daily = df.groupby(["운전자", "운행일_dt", "운행일", "연도", "월", "요일"]).agg(
+        총시간_분=("보정운행시간", "sum"),
+        야간_분=("야간_분", "sum"),
+    ).reset_index()
+
+    # ─ 공휴일 집합 ─
+    pub_hol_set = set(KOREAN_HOLIDAYS.keys())
+
+    # ─ 운전자별 지정휴일 요일 dict ─
+    hol_lookup = {}
+    if driver_hol_df is not None and not driver_hol_df.empty:
+        hdf = driver_hol_df.copy()
+        hdf.columns = [c.strip() for c in hdf.columns]
+        dcol = next((c for c in ["운전자","이름","성명","name"] if c in hdf.columns), hdf.columns[0])
+        hdf = hdf.rename(columns={dcol: "운전자"})
+        for _, row in hdf.iterrows():
+            d = str(row["운전자"]).strip()
+            hol_lookup[d] = {int(row.get("지정휴일1", 5)), int(row.get("지정휴일2", 6))}
+
+    def is_holiday(driver, dt):
+        d = dt.date() if hasattr(dt, "date") else dt
+        if d in pub_hol_set:
+            return True
+        if driver in hol_lookup and dt.weekday() in hol_lookup[driver]:
+            return True
+        return False
+
+    daily["휴일여부"] = daily.apply(
+        lambda r: is_holiday(r["운전자"], r["운행일_dt"]), axis=1
+    )
+    daily["쉬프트유형"] = daily["총시간_분"].apply(
+        lambda x: "단축" if x < 300 else "정상"
+    )
+
+    # ─ 6분류 계산 ─
+    def calc_cats(row):
+        t     = float(row["총시간_분"])
+        night = float(row["야간_분"])
+        hol   = row["휴일여부"]
+        shift = row["쉬프트유형"]
+
+        if hol:
+            return pd.Series({
+                "A_평일8h": 0.0,
+                "B_평일9h상계": 0.0,
+                "C_야간": night,
+                "D_쉬프트단축": 0.0,
+                "E_휴일8h": min(t, 480.0),
+                "F_휴일8h초과": max(t - 480.0, 0.0),
+            })
+        else:
+            if shift == "단축":
+                return pd.Series({
+                    "A_평일8h": 0.0,
+                    "B_평일9h상계": 0.0,
+                    "C_야간": night,
+                    "D_쉬프트단축": t - 300.0,   # 음수=미달, 양수=초과
+                    "E_휴일8h": 0.0,
+                    "F_휴일8h초과": 0.0,
+                })
+            else:
+                return pd.Series({
+                    "A_평일8h": min(t, 480.0),
+                    "B_평일9h상계": t - 540.0,    # 음수=미달, 양수=초과
+                    "C_야간": night,
+                    "D_쉬프트단축": 0.0,
+                    "E_휴일8h": 0.0,
+                    "F_휴일8h초과": 0.0,
+                })
+
+    cats = daily.apply(calc_cats, axis=1)
+    return pd.concat([daily, cats], axis=1)
+
+
+def monthly_work_summary(df_cls):
+    """일별 6분류 → 월별 개인별 합계 (분 및 시간)"""
+    grp = df_cls.groupby(["운전자", "연도", "월"]).agg(
+        근무일수=("운행일_dt", "nunique"),
+        정상일수=(  "쉬프트유형", lambda x: (x=="정상").sum()),
+        단축일수=(  "쉬프트유형", lambda x: (x=="단축").sum()),
+        휴일일수=(  "휴일여부",   "sum"),
+        A_평일8h_분=("A_평일8h", "sum"),
+        B_평일9h상계_분=("B_평일9h상계", "sum"),
+        C_야간_분=("C_야간", "sum"),
+        D_쉬프트단축_분=("D_쉬프트단축", "sum"),
+        E_휴일8h_분=("E_휴일8h", "sum"),
+        F_휴일8h초과_분=("F_휴일8h초과", "sum"),
+    ).reset_index()
+
+    for col in ["A_평일8h", "B_평일9h상계", "C_야간", "D_쉬프트단축", "E_휴일8h", "F_휴일8h초과"]:
+        grp[f"{col}_시간"] = (grp[f"{col}_분"] / 60).round(2)
+
+    return grp
+
 def to_excel(df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -498,11 +616,12 @@ with st.sidebar:
 # ============================================================
 # 메인 탭 구성
 # ============================================================
-tab_main, tab_anom, tab_work, tab_attend, tab_dl = st.tabs([
+tab_main, tab_anom, tab_work, tab_attend, tab_labor, tab_dl = st.tabs([
     "📊 데이터 현황",
     "⚠️ 이상값 분석",
     "⏱️ 개인별 근로시간",
     "📅 근무일수 / 만근일수",
+    "⚖️ 근로시간 재산정",
     "💾 다운로드",
 ])
 
@@ -732,8 +851,112 @@ with tab_attend:
         ])
         st.dataframe(hol_list, use_container_width=True, hide_index=True)
 
+
 # ============================================================
-# Tab 5: 다운로드
+# Tab 5: 근로시간 재산정 (통상임금 소송용)
+# ============================================================
+with tab_labor:
+    st.subheader("⚖️ 실제 근로시간 재산정")
+    st.caption("임금협정 기준(9h/5h) 대비 실제 운행시간 기반 재산정 | 통상임금 소송용")
+
+    with st.spinner("근로시간 6분류 계산 중..."):
+        df_cls = classify_work_hours(df_proc, driver_hol_df)
+        df_monthly_labor = monthly_work_summary(df_cls)
+
+    # ── 필터 ──
+    lc1, lc2, lc3 = st.columns(3)
+    sel_ly = lc1.selectbox("연도", years_list, key="l_y")
+    sel_lm = lc2.selectbox("월",   months_list, key="l_m")
+    sel_ld = lc3.selectbox("운전자", ["전체"] + sorted(df_cls["운전자"].unique()), key="l_d")
+
+    filt_cls = df_cls[(df_cls["연도"]==sel_ly) & (df_cls["월"]==sel_lm)]
+    if sel_ld != "전체":
+        filt_cls = filt_cls[filt_cls["운전자"]==sel_ld]
+
+    filt_mo = df_monthly_labor[(df_monthly_labor["연도"]==sel_ly) & (df_monthly_labor["월"]==sel_lm)]
+    if sel_ld != "전체":
+        filt_mo = filt_mo[filt_mo["운전자"]==sel_ld]
+
+    # ── KPI ──
+    k1,k2,k3,k4,k5 = st.columns(5)
+    k1.metric("정상쉬프트 일수", f'{filt_cls[filt_cls["쉬프트유형"]=="정상"].shape[0]:,}일')
+    k2.metric("단축쉬프트 일수", f'{filt_cls[filt_cls["쉬프트유형"]=="단축"].shape[0]:,}일')
+    k3.metric("휴일 근무일수",   f'{filt_cls["휴일여부"].sum():,}일')
+    k4.metric("야간 총시간",     f'{filt_cls["C_야간"].sum()/60:.1f}h')
+    k5.metric("9h 초과(월계)",   f'{filt_mo["B_평일9h상계_시간"].sum():.1f}h' if not filt_mo.empty else "─")
+
+    st.markdown("---")
+
+    # ── 일별 상세 ──
+    st.markdown("#### 📋 일별 근로시간 분류 (분 단위)")
+    show_daily = filt_cls[[
+        "운행일","운전자","휴일여부","쉬프트유형","총시간_분","야간_분",
+        "A_평일8h","B_평일9h상계","C_야간","D_쉬프트단축","E_휴일8h","F_휴일8h초과"
+    ]].copy()
+    show_daily.columns = [
+        "날짜","운전자","휴일","쉬프트","총시간(분)","야간(분)",
+        "A.평일8h","B.평일9h상계","C.야간","D.쉬프트단축","E.휴일8h","F.휴일8h초과"
+    ]
+    # 음수값 강조 표시를 위한 스타일
+    def highlight_neg(val):
+        if isinstance(val, (int, float)) and val < 0:
+            return "color: red"
+        return ""
+    st.dataframe(
+        show_daily.sort_values(["운전자","날짜"]).reset_index(drop=True)
+                  .style.applymap(highlight_neg,
+                    subset=["B.평일9h상계","D.쉬프트단축"]),
+        use_container_width=True, hide_index=True
+    )
+
+    st.markdown("---")
+
+    # ── 월별 집계 ──
+    st.markdown("#### 📊 월별 개인별 근로시간 합계 (시간 단위)")
+    st.caption("B·D 항목은 음수=기준 미달(임금 과지급 가능), 양수=기준 초과(추가 임금 발생)")
+
+    show_mo = filt_mo[[
+        "운전자","근무일수","정상일수","단축일수","휴일일수",
+        "A_평일8h_시간","B_평일9h상계_시간","C_야간_시간",
+        "D_쉬프트단축_시간","E_휴일8h_시간","F_휴일8h초과_시간"
+    ]].copy()
+    show_mo.columns = [
+        "운전자","근무일","정상일","단축일","휴일일",
+        "A.평일8h","B.평일9h상계","C.야간",
+        "D.쉬프트단축","E.휴일8h","F.휴일8h초과"
+    ]
+    st.dataframe(
+        show_mo.sort_values("운전자").reset_index(drop=True)
+               .style.applymap(highlight_neg, subset=["B.평일9h상계","D.쉬프트단축"]),
+        use_container_width=True, hide_index=True
+    )
+
+    st.markdown("---")
+    st.markdown("#### 📥 재산정 결과 다운로드")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "📥 일별 상세 (전체)",
+            to_excel(show_daily),
+            f"근로시간재산정_일별_{sel_ly}{str(sel_lm).zfill(2)}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_labor_daily"
+        )
+    with dl2:
+        st.download_button(
+            "📥 월별 집계 (전체)",
+            to_excel(df_monthly_labor),
+            "근로시간재산정_월별전체.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_labor_monthly"
+        )
+
+    if not driver_hol_df is not None:
+        st.info("💡 지정휴일 파일을 업로드하면 운전자별 지정휴일이 '휴일'로 정확히 분류됩니다.")
+
+
+# ============================================================
+# Tab 6: 다운로드
 # ============================================================
 with tab_dl:
     st.subheader("💾 결과 다운로드")
