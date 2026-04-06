@@ -26,24 +26,53 @@ st.set_page_config(
 
 # ── 브라우저 자동번역 차단 (Chrome / 네이버 웨일 번역 충돌 방지) ──
 st.markdown("""
-<meta name="google" content="notranslate">
 <style>
   .goog-te-banner-frame { display: none !important; }
   body { top: 0 !important; }
 </style>
 <script>
-  document.documentElement.lang = 'ko';
-  document.documentElement.translate = false;
-  window.addEventListener('DOMContentLoaded', function() {
-    var meta = document.createElement('meta');
-    meta.name = 'google';
-    meta.content = 'notranslate';
-    document.head.appendChild(meta);
-    var meta2 = document.createElement('meta');
-    meta2.httpEquiv = 'Content-Language';
-    meta2.content = 'ko';
-    document.head.appendChild(meta2);
-  });
+(function() {
+  // 1) 즉시 실행: 페이지 언어 고정 + notranslate 클래스 추가
+  var html = document.documentElement;
+  html.setAttribute('lang', 'ko');
+  html.setAttribute('translate', 'no');
+  html.classList.add('notranslate');
+
+  // 2) head에 meta 태그 삽입
+  function injectMeta() {
+    if (document.head) {
+      var m1 = document.createElement('meta');
+      m1.name = 'google'; m1.content = 'notranslate';
+      document.head.insertBefore(m1, document.head.firstChild);
+      var m2 = document.createElement('meta');
+      m2.httpEquiv = 'Content-Language'; m2.content = 'ko';
+      document.head.insertBefore(m2, document.head.firstChild);
+    }
+  }
+  if (document.head) { injectMeta(); }
+  else { document.addEventListener('DOMContentLoaded', injectMeta); }
+
+  // 3) removeChild 패치: 번역기가 React 노드를 잘못 삭제할 때 에러 방지
+  var origRemoveChild = Node.prototype.removeChild;
+  Node.prototype.removeChild = function(child) {
+    if (child && child.parentNode === this) {
+      return origRemoveChild.call(this, child);
+    }
+    // 자식이 아닌 노드 제거 시도 → 무시 (번역기 충돌 방지)
+    console.warn('[notranslate] removeChild 무시됨 (번역기 충돌 방지)');
+    return child;
+  };
+
+  // 4) insertBefore 패치
+  var origInsertBefore = Node.prototype.insertBefore;
+  Node.prototype.insertBefore = function(newNode, refNode) {
+    if (refNode && refNode.parentNode !== this) {
+      console.warn('[notranslate] insertBefore 무시됨 (번역기 충돌 방지)');
+      return newNode;
+    }
+    return origInsertBefore.call(this, newNode, refNode);
+  };
+})();
 </script>
 """, unsafe_allow_html=True)
 
