@@ -878,13 +878,13 @@ def generate_report_excel(df_with_wages, df_proc_detail):
         ts_by_year = drv_df.groupby('연도')['통상시급'].first().to_dict()
 
         # ── 헤더 4행 ──
-        # Row 1
-        ws.merge_cells('B1:J1')
+        # Row 1: B1:F1 병합(이름), K1(내용증명) - 병합범위 밖에 배치
+        ws.merge_cells('B1:F1')
         set_cell(ws, 1, 2, f'{idx:03d}번 원고 {driver}', font=Font(bold=True, size=10, name='맑은 고딕'), align=center)
-        set_cell(ws, 1, 7, '내용증명', font=bold, align=center)
+        set_cell(ws, 1, 11, '내용증명', font=bold, align=center)
 
         # Row 2
-        ws.merge_cells('B2:J2')
+        ws.merge_cells('B2:I2')
         set_cell(ws, 2, 2, '1. (실제 근로시간)', font=bold, align=center, fill=hdr_fill)
         ws.merge_cells('L2:S2')
         set_cell(ws, 2, 12, '2. (실제 근로시간에 해당하는 급여 재산정액)', font=bold, align=center, fill=hdr_fill2)
