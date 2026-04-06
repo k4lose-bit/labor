@@ -504,6 +504,18 @@ def classify_work_hours(df_proc, driver_hol_df, driver_info_df=None):
     hol_lookup = build_hol_lookup(driver_hol_df)
     if not hol_lookup:
         hol_lookup = build_hol_lookup(driver_info_df)
+    # CSV에도 지정휴일 없으면 → 사이드바 기본값으로 전체 운전자 적용
+    if not hol_lookup:
+        wmap = {"월":0,"화":1,"수":2,"목":3,"금":4,"토":5,"일":6}
+        try:
+            import streamlit as _st
+            hd1 = wmap.get(_st.session_state.get("def_hd1","토"), 5)
+            hd2 = wmap.get(_st.session_state.get("def_hd2","일"), 6)
+        except Exception:
+            hd1, hd2 = 5, 6  # 기본값: 토+일
+        # 운행데이터의 모든 운전자에 동일 적용
+        for drv in df["운전자"].unique():
+            hol_lookup[str(drv)] = {hd1, hd2}
 
     def is_holiday(driver, dt):
         d = dt.date() if hasattr(dt, "date") else dt
@@ -1122,6 +1134,11 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.subheader("📅 지정휴일 기본 설정")
+    st.caption("운전자별 CSV 없을 때 적용되는 기본값")
+    wday_opts = ["월","화","수","목","금","토","일"]
+    default_hd1 = st.selectbox("기본 지정휴일①", wday_opts, index=5, key="def_hd1")
+    default_hd2 = st.selectbox("기본 지정휴일②", wday_opts, index=6, key="def_hd2")
     st.caption("📌 000000 미등록 운전자는 포함 처리 (추후 역추적 등록 예정)")
 
 # ============================================================
