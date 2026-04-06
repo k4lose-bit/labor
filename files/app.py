@@ -1,0 +1,715 @@
+"""
+운전자 근로시간 분석 대시보드 v1.0
+- 운행 단말기 데이터 기반 개인별 실제 근로시간 산출
+- 이상값(미조작/과장조작) 자동 탐지 및 보정
+- 개인별 근무일수 / 만근일수 산출
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, date
+import calendar
+import io
+import warnings
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 앱 기본 설정
+# ============================================================
+st.set_page_config(
+    page_title="운전자 근로시간 분석",
+    page_icon="🚌",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============================================================
+# 한국 공휴일 (공휴일에 관한 규정 / 대체공휴일 포함)
+# 2020 ~ 2025
+# ============================================================
+KOREAN_HOLIDAYS = {
+    # ─── 2020 ───
+    date(2020, 1, 1): "신정",
+    date(2020, 1, 24): "설날 연휴",
+    date(2020, 1, 25): "설날",
+    date(2020, 1, 26): "설날 연휴",
+    date(2020, 1, 27): "설날 대체공휴일",
+    date(2020, 3, 1): "삼일절",
+    date(2020, 4, 15): "국회의원선거일",
+    date(2020, 4, 30): "부처님오신날 대체공휴일",
+    date(2020, 5, 1): "근로자의날",
+    date(2020, 5, 5): "어린이날",
+    date(2020, 6, 6): "현충일",
+    date(2020, 8, 15): "광복절",
+    date(2020, 8, 17): "광복절 대체공휴일",
+    date(2020, 9, 30): "추석 연휴",
+    date(2020, 10, 1): "추석",
+    date(2020, 10, 2): "추석 연휴",
+    date(2020, 10, 3): "개천절",
+    date(2020, 10, 9): "한글날",
+    date(2020, 12, 25): "성탄절",
+    # ─── 2021 ───
+    date(2021, 1, 1): "신정",
+    date(2021, 2, 11): "설날 연휴",
+    date(2021, 2, 12): "설날",
+    date(2021, 2, 13): "설날 연휴",
+    date(2021, 3, 1): "삼일절",
+    date(2021, 5, 1): "근로자의날",
+    date(2021, 5, 5): "어린이날",
+    date(2021, 5, 19): "부처님오신날",
+    date(2021, 6, 6): "현충일",
+    date(2021, 8, 15): "광복절",
+    date(2021, 8, 16): "광복절 대체공휴일",
+    date(2021, 9, 20): "추석 연휴",
+    date(2021, 9, 21): "추석",
+    date(2021, 9, 22): "추석 연휴",
+    date(2021, 10, 3): "개천절",
+    date(2021, 10, 4): "추석 대체공휴일",
+    date(2021, 10, 9): "한글날",
+    date(2021, 10, 11): "한글날 대체공휴일",
+    date(2021, 12, 25): "성탄절",
+    # ─── 2022 ───
+    date(2022, 1, 1): "신정",
+    date(2022, 1, 31): "설날 연휴",
+    date(2022, 2, 1): "설날",
+    date(2022, 2, 2): "설날 연휴",
+    date(2022, 3, 1): "삼일절",
+    date(2022, 3, 9): "대통령선거일",
+    date(2022, 5, 1): "근로자의날",
+    date(2022, 5, 5): "어린이날",
+    date(2022, 5, 8): "어린이날 대체공휴일",
+    date(2022, 5, 9): "부처님오신날",
+    date(2022, 6, 1): "지방선거일",
+    date(2022, 6, 6): "현충일",
+    date(2022, 8, 15): "광복절",
+    date(2022, 9, 9): "추석 연휴",
+    date(2022, 9, 10): "추석",
+    date(2022, 9, 11): "추석 연휴",
+    date(2022, 9, 12): "추석 대체공휴일",
+    date(2022, 10, 3): "개천절",
+    date(2022, 10, 9): "한글날",
+    date(2022, 10, 10): "한글날 대체공휴일",
+    date(2022, 12, 25): "성탄절",
+    date(2022, 12, 26): "성탄절 대체공휴일",
+    # ─── 2023 ───
+    date(2023, 1, 1): "신정",
+    date(2023, 1, 21): "설날 연휴",
+    date(2023, 1, 22): "설날",
+    date(2023, 1, 23): "설날 연휴",
+    date(2023, 1, 24): "설날 대체공휴일",
+    date(2023, 3, 1): "삼일절",
+    date(2023, 5, 1): "근로자의날",
+    date(2023, 5, 5): "어린이날",
+    date(2023, 5, 27): "부처님오신날",
+    date(2023, 5, 29): "부처님오신날 대체공휴일",
+    date(2023, 6, 6): "현충일",
+    date(2023, 8, 15): "광복절",
+    date(2023, 9, 28): "추석 연휴",
+    date(2023, 9, 29): "추석",
+    date(2023, 9, 30): "추석 연휴",
+    date(2023, 10, 2): "임시공휴일",
+    date(2023, 10, 3): "개천절",
+    date(2023, 10, 9): "한글날",
+    date(2023, 12, 25): "성탄절",
+    # ─── 2024 ───
+    date(2024, 1, 1): "신정",
+    date(2024, 2, 9): "설날 연휴",
+    date(2024, 2, 10): "설날",
+    date(2024, 2, 11): "설날 연휴",
+    date(2024, 2, 12): "설날 대체공휴일",
+    date(2024, 3, 1): "삼일절",
+    date(2024, 4, 10): "국회의원선거일",
+    date(2024, 5, 1): "근로자의날",
+    date(2024, 5, 5): "어린이날",
+    date(2024, 5, 6): "어린이날 대체공휴일",
+    date(2024, 5, 15): "부처님오신날",
+    date(2024, 6, 6): "현충일",
+    date(2024, 8, 15): "광복절",
+    date(2024, 9, 16): "추석 연휴",
+    date(2024, 9, 17): "추석",
+    date(2024, 9, 18): "추석 연휴",
+    date(2024, 10, 3): "개천절",
+    date(2024, 10, 9): "한글날",
+    date(2024, 12, 25): "성탄절",
+    # ─── 2025 ───
+    date(2025, 1, 1): "신정",
+    date(2025, 1, 28): "설날 연휴",
+    date(2025, 1, 29): "설날",
+    date(2025, 1, 30): "설날 연휴",
+    date(2025, 3, 1): "삼일절",
+    date(2025, 3, 3): "삼일절 대체공휴일",
+    date(2025, 5, 1): "근로자의날",
+    date(2025, 5, 5): "어린이날",
+    date(2025, 5, 6): "부처님오신날",
+    date(2025, 6, 6): "현충일",
+    date(2025, 8, 15): "광복절",
+    date(2025, 10, 3): "개천절",
+    date(2025, 10, 5): "추석 연휴",
+    date(2025, 10, 6): "추석",
+    date(2025, 10, 7): "추석 연휴",
+    date(2025, 10, 8): "추석 대체공휴일",
+    date(2025, 10, 9): "한글날",
+    date(2025, 12, 25): "성탄절",
+}
+
+WEEKDAY_MAP = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+WEEKDAY_REV = {v: k for k, v in WEEKDAY_MAP.items()}
+
+# ============================================================
+# 핵심 처리 함수
+# ============================================================
+
+def parse_trip_minutes(start_str, end_str):
+    """운행출발~종료 시각(HH:MM:SS)을 분 단위 운행시간으로 변환. 자정 넘김 처리."""
+    try:
+        s = str(start_str)
+        e = str(end_str)
+        sh, sm = int(s[0:2]), int(s[3:5])
+        eh, em = int(e[0:2]), int(e[3:5])
+        s_mins = sh * 60 + sm
+        e_mins = eh * 60 + em
+        if e_mins < s_mins:         # 자정을 넘기는 운행
+            e_mins += 1440
+        return e_mins - s_mins
+    except Exception:
+        return np.nan
+
+
+def get_start_minutes(start_str):
+    """운행출발일시 → 분(0~1439)"""
+    try:
+        s = str(start_str)
+        return int(s[0:2]) * 60 + int(s[3:5])
+    except Exception:
+        return np.nan
+
+
+@st.cache_data(show_spinner=False)
+def load_operation_files(file_list):
+    """운행데이터 xlsx 여러 파일 → 통합 DataFrame"""
+    dfs = []
+    errors = []
+    for f in file_list:
+        try:
+            df = pd.read_excel(f, header=2)
+            df = df.dropna(subset=["운행일"])
+            dfs.append(df)
+        except Exception as ex:
+            errors.append(f"{f.name}: {ex}")
+    if errors:
+        for e in errors:
+            st.warning(f"⚠️ 파일 로드 실패 → {e}")
+    if not dfs:
+        return pd.DataFrame()
+
+    out = pd.concat(dfs, ignore_index=True)
+    out.drop_duplicates(inplace=True)
+
+    # 기본 파생 컬럼
+    out["운행일"] = out["운행일"].astype(str).str.strip()
+    out["운행일_dt"] = pd.to_datetime(out["운행일"], format="%Y%m%d", errors="coerce")
+    out["연도"] = out["운행일_dt"].dt.year.astype("Int64")
+    out["월"] = out["운행일_dt"].dt.month.astype("Int64")
+    out["요일"] = out["운행일_dt"].dt.dayofweek   # 0=월 … 6=일
+    out["노선"] = out["노선"].astype(str).str.strip()
+    out["운전자"] = out["운전자"].astype(str).str.strip()
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_route_ref(file):
+    """인가현황 파일 → 노선별 인가운행시간 참조 테이블"""
+    df = pd.read_excel(file, header=2)
+    df = df.dropna(subset=["노선"])
+    df = df.rename(columns={"운행시간": "인가운행시간", "적용년": "연도"})
+    df["노선"] = df["노선"].astype(str).str.strip()
+    df["연도"] = pd.to_numeric(df["연도"], errors="coerce").astype("Int64")
+    df["인가운행시간"] = pd.to_numeric(df["인가운행시간"], errors="coerce")
+    return df[["회사명", "연도", "노선", "인가운행시간"]].drop_duplicates()
+
+
+@st.cache_data(show_spinner=False)
+def process_data(_df_raw, _route_ref, short_min, extra_min):
+    """
+    메인 처리:
+    1) 타임스탬프 기반 운행시간 계산
+    2) 노선별 인가운행시간 조인
+    3) 이상값 탐지 (단시간 / 장시간)
+    4) 이상값 보정 (같은 월·요일·노선·출발±60분 정상 평균)
+    """
+    df = _df_raw.copy()
+
+    # ── 1. 운행시간 계산 ──
+    df["계산운행시간"] = df.apply(
+        lambda r: parse_trip_minutes(r["운행출발일시"], r["운행종료일시"]), axis=1
+    )
+    df["출발분"] = df["운행출발일시"].apply(get_start_minutes)
+
+    # ── 2. 인가운행시간 조인 ──
+    if _route_ref is not None and not _route_ref.empty:
+        df = df.merge(
+            _route_ref[["노선", "연도", "인가운행시간"]].drop_duplicates(),
+            on=["노선", "연도"], how="left"
+        )
+    else:
+        df["인가운행시간"] = np.nan
+
+    # ── 3. 이상값 탐지 ──
+    df["이상값_상한"] = df["인가운행시간"].fillna(300) + extra_min
+    df["이상값여부"] = (
+        (df["계산운행시간"] < short_min) |
+        (df["계산운행시간"] > df["이상값_상한"])
+    )
+    df["이상값_유형"] = ""
+    df.loc[df["계산운행시간"] < short_min, "이상값_유형"] = "단시간(미조작)"
+    df.loc[df["계산운행시간"] > df["이상값_상한"], "이상값_유형"] = "장시간(과장조작)"
+
+    # ── 4. 이상값 보정 ──
+    # 정상 레코드로 참조 테이블 구성 (출발 2시간 버킷 × 노선 × 요일 × 연도·월)
+    normal = df[~df["이상값여부"]].copy()
+    normal["출발_버킷"] = (normal["출발분"] // 120) * 120   # 2시간 단위
+
+    ref = (
+        normal.groupby(["연도", "월", "노선", "요일", "출발_버킷"])["계산운행시간"]
+        .mean()
+        .reset_index()
+        .rename(columns={"계산운행시간": "보정기준시간"})
+    )
+    # fallback: 연도·월·노선 평균
+    ref_fallback = (
+        normal.groupby(["연도", "월", "노선"])["계산운행시간"]
+        .mean()
+        .reset_index()
+        .rename(columns={"계산운행시간": "보정기준시간_fallback"})
+    )
+
+    df["출발_버킷"] = (df["출발분"] // 120) * 120
+    df = df.merge(ref, on=["연도", "월", "노선", "요일", "출발_버킷"], how="left")
+    df = df.merge(ref_fallback, on=["연도", "월", "노선"], how="left")
+
+    df["보정운행시간"] = df["계산운행시간"].copy().astype(float)
+    anom_mask = df["이상값여부"]
+    # 1차 대체: 버킷 기반 평균
+    df.loc[anom_mask & df["보정기준시간"].notna(), "보정운행시간"] = \
+        df.loc[anom_mask & df["보정기준시간"].notna(), "보정기준시간"]
+    # 2차 대체: 노선·월 평균
+    still_anom = anom_mask & df["보정운행시간"].isna()
+    df.loc[still_anom & df["보정기준시간_fallback"].notna(), "보정운행시간"] = \
+        df.loc[still_anom & df["보정기준시간_fallback"].notna(), "보정기준시간_fallback"]
+    # 3차 대체: 인가운행시간 사용
+    still_anom2 = anom_mask & df["보정운행시간"].isna()
+    df.loc[still_anom2, "보정운행시간"] = df.loc[still_anom2, "인가운행시간"].fillna(120)
+
+    df["보정운행시간"] = df["보정운행시간"].round(1)
+    return df
+
+
+def build_daily_v2(df_proc):
+    """처리된 데이터 → 개인별 일별 집계 (버그 없는 버전)"""
+    daily = df_proc.groupby(
+        ["운전자", "운행일_dt", "운행일", "연도", "월", "요일"]
+    ).agg(
+        운행횟수=("보정운행시간", "count"),
+        총운행시간_분=("보정운행시간", "sum"),
+        이상값포함=("이상값여부", "any"),
+    ).reset_index()
+    daily["총운행시간_시간"] = (daily["총운행시간_분"] / 60).round(2)
+    return daily
+
+
+def calc_mangeun(year, month, hd1, hd2):
+    """
+    만근일수 = 달력일수 - 지정휴일수 - 공휴일수(지정휴일 요일 제외)
+    hd1, hd2: 지정휴일 요일번호 (0=월 … 6=일)
+    """
+    _, days = calendar.monthrange(year, month)
+    # 해당 월의 지정휴일 날짜 집합
+    designated = set()
+    for d in range(1, days + 1):
+        dt = date(year, month, d)
+        if dt.weekday() in (hd1, hd2):
+            designated.add(dt)
+    # 해당 월의 법정공휴일
+    pub_hols = {d for d in KOREAN_HOLIDAYS if d.year == year and d.month == month}
+    # 지정휴일과 겹치지 않는 공휴일만 차감
+    extra = pub_hols - designated
+    mangeun = days - len(designated) - len(extra)
+    return {
+        "달력일수": days,
+        "지정휴일수": len(designated),
+        "비중복_공휴일수": len(extra),
+        "만근일수": mangeun,
+        "공휴일목록": sorted(extra),
+    }
+
+
+def monthly_attendance(df_daily, driver_hol_df, year, month):
+    """월별 운전자별 근무일수 + 만근일수 테이블"""
+    # 근무일수
+    sub = df_daily[(df_daily["연도"] == year) & (df_daily["월"] == month)]
+    wdays = sub.groupby("운전자")["운행일_dt"].nunique().reset_index()
+    wdays.columns = ["운전자", "근무일수"]
+    wdays["총운행시간_시간"] = sub.groupby("운전자")["총운행시간_시간"].sum().values
+
+    if driver_hol_df is None or driver_hol_df.empty:
+        wdays["만근일수"] = "─"
+        wdays["초과/미달"] = "─"
+        return wdays
+
+    rows = []
+    for _, drow in driver_hol_df.iterrows():
+        driver = drow["운전자"]
+        hd1 = int(drow.get("지정휴일1", 5))
+        hd2 = int(drow.get("지정휴일2", 6))
+        mg = calc_mangeun(year, month, hd1, hd2)
+        rows.append({"운전자": driver, **mg})
+    mg_df = pd.DataFrame(rows)
+
+    result = wdays.merge(mg_df[["운전자", "달력일수", "지정휴일수", "비중복_공휴일수", "만근일수"]], on="운전자", how="left")
+    result["초과/미달"] = result["근무일수"] - result["만근일수"].fillna(0)
+    return result
+
+
+def to_excel(df):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="데이터")
+    return buf.getvalue()
+
+
+# ============================================================
+# 사이드바 UI
+# ============================================================
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/96/bus.png", width=60)
+    st.title("운전자 근로시간 분석")
+    st.caption("v1.0 · 대원교통")
+    st.markdown("---")
+
+    st.subheader("📂 파일 업로드")
+    uploaded_ops = st.file_uploader(
+        "① 운행데이터 (xlsx, 여러 개)",
+        type=["xlsx"], accept_multiple_files=True, key="ops"
+    )
+    uploaded_route = st.file_uploader(
+        "② 인가현황 (xls 변환본 xlsx)",
+        type=["xlsx"], key="route"
+    )
+    uploaded_hol = st.file_uploader(
+        "③ 지정휴일 (CSV)",
+        type=["csv"], key="hol"
+    )
+
+    # 지정휴일 템플릿 다운로드
+    tmpl = pd.DataFrame({
+        "운전자": ["홍길동", "김철수", "이영희"],
+        "지정휴일1": ["토", "금", "토"],
+        "지정휴일2": ["일", "토", "일"],
+    })
+    st.download_button(
+        "📥 지정휴일 템플릿",
+        tmpl.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        "지정휴일_템플릿.csv", "text/csv"
+    )
+
+    st.markdown("---")
+    st.subheader("⚙️ 이상값 기준")
+    short_min = st.slider("최소 운행시간 (분)", 1, 30, 10,
+                          help="이 값 미만이면 '미조작' 이상값으로 처리")
+    extra_min = st.slider("인가시간 초과 허용 (분)", 0, 120, 60,
+                          help="인가운행시간 + 이 값 초과 시 이상값 처리")
+    st.caption(f"예: 2016노선(245분) → 상한 {245+extra_min}분")
+
+    st.markdown("---")
+    st.caption("📌 000000 미등록 운전자는 포함 처리 (추후 역추적 등록 예정)")
+
+# ============================================================
+# 메인 탭 구성
+# ============================================================
+tab_main, tab_anom, tab_work, tab_attend, tab_dl = st.tabs([
+    "📊 데이터 현황",
+    "⚠️ 이상값 분석",
+    "⏱️ 개인별 근로시간",
+    "📅 근무일수 / 만근일수",
+    "💾 다운로드",
+])
+
+# ─── 데이터가 없을 때 안내 ───
+if not uploaded_ops:
+    with tab_main:
+        st.info("👈 좌측 사이드바에서 운행데이터 파일을 업로드하세요.")
+        st.markdown("""
+        ### 📋 사용 방법
+        1. **운행데이터 파일** 업로드 (월별 xlsx 파일, 여러 개 동시 가능)
+        2. **인가현황 파일** 업로드 (노선별 이상값 기준 자동 설정)
+        3. **지정휴일 파일** 업로드 (운전자별 만근일수 계산)
+        4. 이상값 탐지 결과 확인 → 보정된 근로시간 확인 → 다운로드
+
+        ### 🔧 처리 로직 요약
+        | 항목 | 내용 |
+        |------|------|
+        | 근로시간 | 회차별 순수 운행시간 합산 (자정 넘김 자동 처리) |
+        | 단시간 이상값 | 10분 미만 → 동일 월·요일·노선·시간대 평균으로 대체 |
+        | 장시간 이상값 | 인가운행시간 + 60분 초과 → 동일 방법으로 대체 |
+        | 대체 fallback | 동일 노선·월 평균 → 인가운행시간 순으로 적용 |
+        | 만근일수 | 달력일수 − 지정휴일 − 비중복공휴일 |
+        | 미등록(000000) | 제외 없이 포함 (추후 역추적 등록) |
+        """)
+    st.stop()
+
+# ─── 데이터 로딩 ───
+with st.spinner("⏳ 파일 로딩 중..."):
+    df_raw = load_operation_files(uploaded_ops)
+
+if df_raw.empty:
+    st.error("운행데이터를 불러오지 못했습니다. 파일 형식을 확인하세요.")
+    st.stop()
+
+route_ref = None
+if uploaded_route:
+    route_ref = load_route_ref(uploaded_route)
+
+driver_hol_df = None
+if uploaded_hol:
+    hol = pd.read_csv(uploaded_hol, encoding="utf-8-sig")
+    # 요일명 → 숫자
+    if "지정휴일1" in hol.columns:
+        hol["지정휴일1"] = hol["지정휴일1"].map(WEEKDAY_MAP).fillna(5).astype(int)
+    if "지정휴일2" in hol.columns:
+        hol["지정휴일2"] = hol["지정휴일2"].map(WEEKDAY_MAP).fillna(6).astype(int)
+    driver_hol_df = hol
+
+# ─── 처리 ───
+with st.spinner("⚙️ 이상값 탐지 및 보정 중..."):
+    df_proc = process_data(df_raw, route_ref, short_min, extra_min)
+
+df_daily = build_daily_v2(df_proc)
+
+years_list = sorted(df_daily["연도"].dropna().unique().astype(int))
+months_list = sorted(df_daily["월"].dropna().unique().astype(int))
+
+# ============================================================
+# Tab 1: 데이터 현황
+# ============================================================
+with tab_main:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("📄 총 레코드", f"{len(df_proc):,}건")
+    c2.metric("👤 운전자 수", f"{df_proc['운전자'].nunique():,}명")
+    c3.metric("🚌 노선 수", f"{df_proc['노선'].nunique():,}개")
+    c4.metric("📅 시작일", str(df_proc["운행일"].min()))
+    c5.metric("📅 종료일", str(df_proc["운행일"].max()))
+
+    st.markdown("---")
+
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.subheader("🗓️ 월별 운행 건수")
+        monthly_cnt = df_proc.groupby(["연도", "월"]).size().reset_index(name="운행건수")
+        monthly_cnt["연월"] = monthly_cnt["연도"].astype(str) + "-" + monthly_cnt["월"].astype(str).str.zfill(2)
+        st.dataframe(monthly_cnt[["연월", "운행건수"]], use_container_width=True, hide_index=True)
+
+    with col_r:
+        if route_ref is not None:
+            st.subheader("📋 노선별 인가운행시간 (참조)")
+            st.dataframe(route_ref.sort_values(["연도", "노선"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("인가현황 파일을 업로드하면 노선별 이상값 기준이 자동으로 설정됩니다.")
+
+    st.markdown("---")
+    st.subheader("🔍 원본 데이터 미리보기")
+    disp_cols = ["운행일", "회사명", "노선", "차량번호", "운전자",
+                 "운행출발일시", "운행종료일시", "운행시간(당회)"]
+    st.dataframe(df_raw[disp_cols].head(200), use_container_width=True, hide_index=True)
+
+# ============================================================
+# Tab 2: 이상값 분석
+# ============================================================
+with tab_anom:
+    anom = df_proc[df_proc["이상값여부"]].copy()
+    total = len(df_proc)
+    anom_cnt = len(anom)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⚠️ 전체 이상값", f"{anom_cnt:,}건", f"{anom_cnt/total*100:.1f}%")
+    c2.metric("🔻 단시간(미조작)", f"{(anom['이상값_유형']=='단시간(미조작)').sum():,}건")
+    c3.metric("🔺 장시간(과장조작)", f"{(anom['이상값_유형']=='장시간(과장조작)').sum():,}건")
+
+    st.markdown("---")
+    st.subheader("이상값 목록")
+
+    # 필터
+    cf1, cf2, cf3 = st.columns(3)
+    f_year = cf1.selectbox("연도", ["전체"] + years_list, key="av_y")
+    f_type = cf2.selectbox("유형", ["전체", "단시간(미조작)", "장시간(과장조작)"], key="av_t")
+    f_route = cf3.selectbox("노선", ["전체"] + sorted(df_proc["노선"].unique()), key="av_r")
+
+    filtered_anom = anom.copy()
+    if f_year != "전체":
+        filtered_anom = filtered_anom[filtered_anom["연도"] == int(f_year)]
+    if f_type != "전체":
+        filtered_anom = filtered_anom[filtered_anom["이상값_유형"] == f_type]
+    if f_route != "전체":
+        filtered_anom = filtered_anom[filtered_anom["노선"] == f_route]
+
+    show_cols = ["운행일", "운전자", "노선", "운행출발일시", "운행종료일시",
+                 "계산운행시간", "인가운행시간", "이상값_상한", "이상값_유형", "보정운행시간"]
+    st.dataframe(
+        filtered_anom[show_cols].sort_values("운행일").reset_index(drop=True),
+        use_container_width=True, hide_index=True
+    )
+
+    st.caption(f"보정기준: 동일 월·요일·노선·출발시간 ±{extra_min}분 정상 평균 → 노선·월 평균 → 인가운행시간 순으로 대체")
+
+# ============================================================
+# Tab 3: 개인별 근로시간
+# ============================================================
+with tab_work:
+    st.subheader("⏱️ 개인별 근로시간")
+
+    c1, c2, c3 = st.columns(3)
+    sel_y = c1.selectbox("연도", years_list, key="w_y")
+    sel_m = c2.selectbox("월", months_list, key="w_m")
+    sel_d = c3.selectbox("운전자", ["전체"] + sorted(df_daily["운전자"].unique()), key="w_d")
+
+    filt = df_daily[(df_daily["연도"] == sel_y) & (df_daily["월"] == sel_m)]
+    if sel_d != "전체":
+        filt = filt[filt["운전자"] == sel_d]
+
+    # KPI
+    k1, k2, k3 = st.columns(3)
+    k1.metric("운전자 수", f"{filt['운전자'].nunique():,}명")
+    k2.metric("평균 일 근로시간", f"{filt['총운행시간_시간'].mean():.1f}시간")
+    k3.metric("이상값 포함 일수", f"{filt['이상값포함'].sum():,}일")
+
+    st.markdown("#### 일별 상세")
+    disp = filt.rename(columns={
+        "운행일": "날짜", "운전자": "운전자", "요일": "요일번호",
+        "운행횟수": "회차수", "총운행시간_분": "근로시간(분)", "총운행시간_시간": "근로시간(시간)"
+    })
+    disp["요일"] = disp["요일번호"].map(WEEKDAY_REV)
+    show = ["날짜", "운전자", "요일", "회차수", "근로시간(분)", "근로시간(시간)", "이상값포함"]
+    st.dataframe(
+        disp[show].sort_values(["운전자", "날짜"]).reset_index(drop=True),
+        use_container_width=True, hide_index=True
+    )
+
+    st.markdown("---")
+    st.markdown("#### 월별 개인별 집계")
+    monthly_per = df_daily.groupby(["연도", "월", "운전자"]).agg(
+        근무일수=("운행일_dt", "nunique"),
+        총운행시간_분=("총운행시간_분", "sum"),
+        총운행시간_시간=("총운행시간_시간", "sum"),
+        이상값포함일수=("이상값포함", "sum"),
+    ).reset_index()
+    monthly_per["총운행시간_시간"] = monthly_per["총운행시간_시간"].round(2)
+    filt2 = monthly_per[(monthly_per["연도"] == sel_y) & (monthly_per["월"] == sel_m)]
+    st.dataframe(
+        filt2.sort_values("총운행시간_시간", ascending=False).reset_index(drop=True),
+        use_container_width=True, hide_index=True
+    )
+
+# ============================================================
+# Tab 4: 근무일수 / 만근일수
+# ============================================================
+with tab_attend:
+    st.subheader("📅 근무일수 및 만근일수")
+
+    c1, c2 = st.columns(2)
+    sel_y2 = c1.selectbox("연도", years_list, key="a_y")
+    sel_m2 = c2.selectbox("월", months_list, key="a_m")
+
+    attend = monthly_attendance(df_daily, driver_hol_df, sel_y2, sel_m2)
+
+    _, days_in_month = calendar.monthrange(sel_y2, sel_m2)
+    pub_this_month = {d: n for d, n in KOREAN_HOLIDAYS.items()
+                      if d.year == sel_y2 and d.month == sel_m2}
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("📆 달력일수", f"{days_in_month}일")
+    k2.metric("🎌 법정공휴일", f"{len(pub_this_month)}일")
+    k3.metric("👥 운전자 수", f"{len(attend):,}명")
+
+    if driver_hol_df is None:
+        st.warning("💡 지정휴일 파일을 업로드하면 **운전자별 만근일수**가 자동 계산됩니다.")
+    else:
+        st.info(
+            f"만근일수 = {days_in_month}(달력) − 지정휴일수 − 비중복공휴일수\n"
+            f"※ 대체공휴일 포함"
+        )
+
+    st.dataframe(attend.sort_values("운전자").reset_index(drop=True),
+                 use_container_width=True, hide_index=True)
+
+    # 해당 월 공휴일 표시
+    if pub_this_month:
+        st.markdown("#### 해당 월 법정공휴일 목록")
+        hol_list = pd.DataFrame([
+            {"날짜": str(d), "요일": WEEKDAY_REV[d.weekday()], "공휴일명": n}
+            for d, n in sorted(pub_this_month.items())
+        ])
+        st.dataframe(hol_list, use_container_width=True, hide_index=True)
+
+# ============================================================
+# Tab 5: 다운로드
+# ============================================================
+with tab_dl:
+    st.subheader("💾 결과 다운로드")
+
+    st.markdown("#### 선택 다운로드")
+    dc1, dc2, dc3 = st.columns(3)
+
+    # ① 처리된 운행 데이터
+    proc_cols = ["운행일", "회사명", "노선", "차량번호", "운전자",
+                 "운행출발일시", "운행종료일시",
+                 "계산운행시간", "인가운행시간", "이상값여부", "이상값_유형", "보정운행시간"]
+    with dc1:
+        st.markdown("**① 처리된 운행 데이터**")
+        st.caption("이상값 탐지·보정 결과 포함")
+        st.download_button(
+            "📥 다운로드",
+            to_excel(df_proc[proc_cols]),
+            "처리된_운행데이터.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_proc"
+        )
+
+    # ② 개인별 일별 근로시간
+    with dc2:
+        st.markdown("**② 개인별 일별 근로시간**")
+        st.caption("운전자 × 날짜 기준 합산")
+        st.download_button(
+            "📥 다운로드",
+            to_excel(df_daily),
+            "개인별_일별_근로시간.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_daily"
+        )
+
+    # ③ 월별 개인별 집계
+    monthly_all = df_daily.groupby(["연도", "월", "운전자"]).agg(
+        근무일수=("운행일_dt", "nunique"),
+        총운행시간_분=("총운행시간_분", "sum"),
+        총운행시간_시간=("총운행시간_시간", "sum"),
+    ).reset_index()
+    monthly_all["총운행시간_시간"] = monthly_all["총운행시간_시간"].round(2)
+    with dc3:
+        st.markdown("**③ 월별 개인별 집계**")
+        st.caption("근무일수 + 총 근로시간")
+        st.download_button(
+            "📥 다운로드",
+            to_excel(monthly_all),
+            "월별_개인별_집계.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_monthly"
+        )
+
+    st.markdown("---")
+    st.markdown("#### 이상값 전체 목록")
+    st.download_button(
+        "📥 이상값 목록 다운로드",
+        to_excel(df_proc[df_proc["이상값여부"]][proc_cols]),
+        "이상값_목록.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_anom"
+    )
