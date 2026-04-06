@@ -472,7 +472,8 @@ if uploaded_route:
 
 driver_hol_df = None
 if uploaded_hol:
-    hol = pd.read_csv(uploaded_hol, encoding="utf-8-sig")
+    content = uploaded_hol.read().decode("utf-8-sig")
+    hol = pd.read_csv(io.StringIO(content))
     # 요일명 → 숫자
     if "지정휴일1" in hol.columns:
         hol["지정휴일1"] = hol["지정휴일1"].map(WEEKDAY_MAP).fillna(5).astype(int)
