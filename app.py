@@ -473,6 +473,7 @@ def classify_work_hours(df_proc, driver_hol_df, driver_info_df=None):
         총시간_분=("보정운행시간", "sum"),
         야간_분=("야간_분", "sum"),
     ).reset_index()
+    daily["대체휴일여부"] = False  # 임시 초기화 (아래서 재설정)
 
     # ─ 공휴일 집합 ─
     pub_hol_set = set(KOREAN_HOLIDAYS.keys())
@@ -534,6 +535,36 @@ def classify_work_hours(df_proc, driver_hol_df, driver_info_df=None):
     daily["쉬프트유형"] = daily["총시간_분"].apply(
         lambda x: "단축" if x < 300 else "정상"
     )
+    daily["대체휴일여부"] = False   # 초기값
+
+    # ── 대체휴일 판단 ──
+    # 월별로: 주중 결근일수(만근 미달일수) = 해당 월 휴일 중 대체로 볼 일수
+    # 주중 결근 = (해당 월 평일 가능일수 - 실제 평일 근무일수)
+    for (driver, year, month), grp in daily.groupby(["운전자","연도","월"]):
+        # 평일 근무일수 (휴일 아닌 날)
+        weekday_worked = grp[~grp["휴일여부"]].shape[0]
+        # 해당 월 평일 가능일수 (달력일수 - 지정휴일수)
+        import calendar as _cal
+        _, days_in_month = _cal.monthrange(int(year), int(month))
+        driver_hols = hol_lookup.get(str(driver), {5,6})
+        designated_days = sum(
+            1 for d in range(1, days_in_month+1)
+            if pd.Timestamp(int(year), int(month), d).weekday() in driver_hols
+        )
+        # 법정공휴일 중 지정휴일 아닌 날도 제외
+        pub_in_month = {d for d in pub_hol_set if d.year==int(year) and d.month==int(month)}
+        extra_pub = len([d for d in pub_in_month if d.weekday() not in driver_hols])
+        max_weekday_days = days_in_month - designated_days - extra_pub
+        # 주중 결근 추정
+        weekday_absent = max(0, max_weekday_days - weekday_worked)
+        # 휴일 근무일 중 대체로 볼 일수
+        hol_days_idx = grp[grp["휴일여부"]].index.tolist()
+        replace_count = min(weekday_absent, len(hol_days_idx))
+        if replace_count > 0:
+            # 가장 이른 휴일 근무일을 대체로 처리
+            replace_idx = hol_days_idx[:replace_count]
+            daily.loc[replace_idx, "대체휴일여부"] = True
+            daily.loc[replace_idx, "휴일여부"] = False  # 평일로 재분류
 
     # ─ 6분류 계산 ─
     def calc_cats(row):
@@ -588,6 +619,7 @@ def monthly_work_summary(df_cls):
         정상일수=(  "쉬프트유형", lambda x: (x=="정상").sum()),
         단축일수=(  "쉬프트유형", lambda x: (x=="단축").sum()),
         휴일일수=(  "휴일여부",   "sum"),
+        대체휴일수=("대체휴일여부","sum"),
         A_평일8h_분=("A_평일8h", "sum"),
         B_평일9h상계_분=("B_평일9h상계", "sum"),
         C_야간_분=("C_야간", "sum"),
@@ -785,69 +817,85 @@ def calc_wages_monthly(df_monthly, driver_info_df, wage_dict):
 
 
 def merge_payroll(df_wages, driver_info_df, payroll_df):
-    """재산정 df + 급여명세서 → 차액 계산"""
+    """재산정 df + 급여명세서 → 차액 계산
+    매칭 우선순위: 사원번호 > 운전자명=성명
+    """
     if payroll_df is None or payroll_df.empty:
         return df_wages
 
     df = df_wages.copy()
+    pay = payroll_df.copy()
 
-    # 사원번호가 아직 없으면 driver_info에서 가져오기
-    if '사원번호' not in df.columns:
-        if driver_info_df is not None:
-            info = driver_info_df.copy()
-            info.columns = [c.strip() for c in info.columns]
-            dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
-            info = info.rename(columns={dcol: '운전자'})
-            if '사원번호' in info.columns:
-                info['사원번호'] = info['사원번호'].astype(str).str.strip().str.zfill(7)
-                df = df.merge(info[['운전자','사원번호']], on='운전자', how='left')
-            else:
-                return df_wages  # 사원번호 정보 없음
-        else:
-            return df_wages
+    # 급여명세서 기본 전처리
+    pay['성명'] = pay['성명'].astype(str).str.strip()
+    pay['사원번호_정규'] = pay['사원번호'].astype(str).str.strip().str.lstrip('0')
 
-    # 사원번호 형식 통일
-    df['사원번호'] = df['사원번호'].astype(str).str.strip().str.zfill(7)
-
-    # 급여명세서 월별 집계
-    pay_cols_avail = {
-        'P_기본급':   '기본급',   'P_연장근로': '연장근로',
-        'P_야간오전': '야간오전', 'P_야간오후': '야간오후',
-        'P_주휴수당': '주휴수당', 'P_휴일오전': '휴일오전',
-        'P_휴일오후': '휴일오후', 'P_경축수당': '경축수당',
-        'P_지급총액': '지급총액_명세',
+    # 급여 항목 집계 함수
+    pay_cols_map = {
+        'P_기본급':'기본급', 'P_연장근로':'연장근로',
+        'P_야간오전':'야간오전', 'P_야간오후':'야간오후',
+        'P_주휴수당':'주휴수당', 'P_휴일오전':'휴일오전',
+        'P_휴일오후':'휴일오후', 'P_경축수당':'경축수당',
+        'P_근로일수':'근로일수',
     }
-    agg_dict = {k: (v, 'sum') for k, v in pay_cols_avail.items()
-                if v in payroll_df.columns}
-    if not agg_dict:
-        return df
+    agg_dict = {k:(v,'sum') for k,v in pay_cols_map.items() if v in pay.columns}
+    if '근로일수' in pay.columns:
+        agg_dict['P_근로일수'] = ('근로일수','mean')
 
-    pay_agg = payroll_df.groupby(['사원번호','연도','월']).agg(**agg_dict).reset_index()
-    pay_agg['사원번호'] = pay_agg['사원번호'].astype(str).str.strip().str.zfill(7)
+    def aggregate_pay(group_cols):
+        try:
+            return pay.groupby(group_cols + ['연도','월']).agg(**agg_dict).reset_index()
+        except Exception:
+            return pd.DataFrame()
 
-    df = df.merge(pay_agg, on=['사원번호','연도','월'], how='left')
+    # ── 방법1: 사원번호 매칭 ──
+    if driver_info_df is not None:
+        info = driver_info_df.copy()
+        info.columns = [c.strip() for c in info.columns]
+        dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
+        info = info.rename(columns={dcol: '운전자'})
+        if '사원번호' in info.columns:
+            info['사원번호_정규'] = info['사원번호'].astype(str).str.strip().str.lstrip('0')
+            df = df.merge(info[['운전자','사원번호_정규']], on='운전자', how='left')
+            pay_agg = aggregate_pay(['사원번호_정규'])
+            if not pay_agg.empty:
+                df = df.merge(pay_agg, on=['사원번호_정규','연도','월'], how='left')
+
+    # ── 방법2: 성명=운전자명 직접 매칭 (사원번호 없거나 매칭 실패시) ──
+    if 'P_기본급' not in df.columns or df['P_기본급'].isna().all():
+        # 사원번호 컬럼 제거 후 이름 매칭
+        for col in [c for c in df.columns if c.startswith('P_')]:
+            df.drop(columns=col, inplace=True, errors='ignore')
+        df['운전자_키'] = df['운전자'].astype(str).str.strip()
+        pay['운전자_키'] = pay['성명'].astype(str).str.strip()
+        pay_agg2 = aggregate_pay(['운전자_키'])
+        if not pay_agg2.empty:
+            df = df.merge(pay_agg2, on=['운전자_키','연도','월'], how='left')
+        df.drop(columns=['운전자_키'], inplace=True, errors='ignore')
 
     # 기지급 합계
-    p_cols = [c for c in ['P_기본급','P_연장근로','P_야간오전','P_야간오후',
-                           'P_주휴수당','P_휴일오전','P_휴일오후','P_경축수당']
-              if c in df.columns]
-    df['P_기지급_합계'] = df[p_cols].fillna(0).sum(axis=1)
+    p_sum_cols = [c for c in ['P_기본급','P_연장근로','P_야간오전','P_야간오후',
+                               'P_주휴수당','P_휴일오전','P_휴일오후','P_경축수당']
+                  if c in df.columns]
+    df['P_기지급_합계'] = df[p_sum_cols].fillna(0).sum(axis=1)
 
-    # 휴일 임금 상계: 재산정 휴일임금 - 기지급 휴일임금
+    # 급여명세서 기지급 근로일수
+    if 'P_근로일수' in df.columns:
+        df['P_근로일수'] = df['P_근로일수'].fillna(0)
+
+    # 휴일임금 상계
     if '통상시급' in df.columns:
         ts = df['통상시급'].fillna(0)
-        # 재산정 휴일임금 (E×1.5 + F×2.0)
-        e_min = df.get('W_E_휴일8h_합', df.get('E_휴일8h_분', pd.Series(0, index=df.index)))
-        f_min = df.get('W_F_휴일8h초과_합', df.get('F_휴일8h초과_분', pd.Series(0, index=df.index)))
-        df['H_휴일재산정임금'] = ((e_min.fillna(0)/60*ts*1.5) + (f_min.fillna(0)/60*ts*2.0)).round().astype(int)
-        # 기지급 휴일임금
-        p_hol_cols = [c for c in ['P_휴일오전','P_휴일오후'] if c in df.columns]
-        df['H_휴일기지급임금'] = df[p_hol_cols].fillna(0).sum(axis=1).astype(int) if p_hol_cols else 0
+        e_m = df.get('E_휴일8h_분', pd.Series(0, index=df.index)).fillna(0)
+        f_m = df.get('F_휴일8h초과_분', pd.Series(0, index=df.index)).fillna(0)
+        df['H_휴일재산정임금'] = ((e_m/60*ts*1.5)+(f_m/60*ts*2.0)).round().astype(int)
+        p_hol = [c for c in ['P_휴일오전','P_휴일오후'] if c in df.columns]
+        df['H_휴일기지급임금'] = df[p_hol].fillna(0).sum(axis=1).astype(int) if p_hol else 0
         df['H_휴일차액'] = df['H_휴일재산정임금'] - df['H_휴일기지급임금']
 
-    # 전체 차액 = 재산정합계 - 기지급합계
+    # 전체 차액
     if '재산정_합계' in df.columns:
-        df['차액'] = df['재산정_합계'] - df['P_기지급_합계']
+        df['차액'] = (df['재산정_합계'] - df['P_기지급_합계']).fillna(df['재산정_합계'])
     return df
 
 
@@ -952,7 +1000,7 @@ def generate_report_excel(df_with_wages, df_proc_detail):
               9:'휴일\n8시간근무', 10:'휴일\n8시간초과',
               12:'평일근무\n8시간기준', 13:'평일9시간\n월상계', 14:'야근수당',
               15:'쉬프트단축', 17:'휴일근무\n8시간', 18:'휴일근무\n8시간초과',
-              20:'통상시급(원)',
+              20:'통상시급(원)', 21:'실제\n근무일수',
               22:'기본급', 23:'연장근로', 24:'야간오전', 25:'야간오후',
               26:'휴일오전', 27:'휴일오후', 29:'차액(+추가지급)'}
         for col, lbl in h4.items():
@@ -1026,6 +1074,11 @@ def generate_report_excel(df_with_wages, df_proc_detail):
                 # 통상시급
                 set_cell(ws, row_num, 20, ts_val, font=normal,
                          align=right_al, border=border, num_format='#,##0')
+                # 실제 근무일수
+                if not sub.empty:
+                    wd = int(sub.iloc[0].get('근무일수', 0) or 0)
+                    set_cell(ws, row_num, 21, wd, font=normal,
+                             align=center, border=border)
 
                 # 3. 기지급 급여명세서
                 if 'P_기본급' in (sub.columns if not sub.empty else []):
