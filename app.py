@@ -696,18 +696,28 @@ def calc_wages_monthly(df_monthly, driver_info_df, wage_dict):
     """
     월별 집계 df + 운전자정보 + 시급 →
     급여 재산정액(A~F) 추가된 df 반환
-    가산율: A×1.0 / B×1.5 / C×0.5 / D×1.5 / E×1.5 / F×2.0
     """
     df = df_monthly.copy()
 
-    # 운전자정보 조인 (고용형태, 호봉번호)
     if driver_info_df is not None and not driver_info_df.empty:
         info = driver_info_df.copy()
         info.columns = [c.strip() for c in info.columns]
+        # 운전자 컬럼 자동 탐지
         dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
         info = info.rename(columns={dcol: '운전자'})
         info['운전자'] = info['운전자'].astype(str).str.strip()
-        df = df.merge(info[['운전자','고용형태','호봉번호']], on='운전자', how='left')
+        # 호봉번호/고용형태 컬럼 자동 탐지 및 정규화
+        for src, dst in [(['호봉번호','호봉','grade'], '호봉번호'),
+                         (['고용형태','고용','type','구분'], '고용형태')]:
+            found = next((c for c in src if c in info.columns), None)
+            if found and found != dst:
+                info = info.rename(columns={found: dst})
+        if '호봉번호' not in info.columns: info['호봉번호'] = 1
+        if '고용형태' not in info.columns: info['고용형태'] = '정규직'
+        # 병합할 컬럼 구성 (사원번호 있으면 포함)
+        merge_cols = ['운전자', '고용형태', '호봉번호']
+        if '사원번호' in info.columns: merge_cols.append('사원번호')
+        df = df.merge(info[merge_cols], on='운전자', how='left')
     else:
         df['고용형태'] = '정규직'
         df['호봉번호'] = 1
