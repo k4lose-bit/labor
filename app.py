@@ -591,6 +591,383 @@ def df_to_hhmm(df, cols):
             out[c] = out[c].apply(mins_to_hhmm)
     return out
 
+
+# ============================================================
+# 시급 / 급여 계산 관련 함수
+# ============================================================
+
+
+@st.cache_data(show_spinner=False)
+def load_payroll(_file):
+    """급여명세서 xlsx → 통합 DataFrame
+    컬럼: 사원번호, 성명, 급여년월, 연도, 월, 기본급, 상여금,
+          연장근로, 야간오전, 야간오후, 휴일오전, 휴일오후,
+          경축수당, 심야수당, 지급총액
+    """
+    xl = pd.ExcelFile(_file)
+    dfs = []
+    for sheet in xl.sheet_names:
+        try:
+            df = pd.read_excel(_file, sheet_name=sheet)
+            df.columns = [str(c).strip() for c in df.columns]
+            if '사원번호' not in df.columns and '성명' not in df.columns:
+                continue
+            dfs.append(df)
+        except Exception:
+            continue
+    if not dfs:
+        return pd.DataFrame()
+    out = pd.concat(dfs, ignore_index=True)
+    out['사원번호'] = out['사원번호'].astype(str).str.strip().str.zfill(7)
+    out['급여년월'] = out['급여년월'].astype(str).str.strip()
+    out['연도'] = out['급여년월'].str[:4].astype(int)
+    out['월']   = out['급여년월'].str[4:6].astype(int)
+    # 지급총액 계산 (명세서 항목 합계, 년차/소급 제외)
+    pay_cols = ['기본급','연장근로','야간오전','야간오후','주휴수당',
+                '휴일오전','휴일오후','경축수당','심야수당','무사고포상',
+                '연장1','연장2','기타수당1','기타수당2','기타수당3','교육수당']
+    for c in pay_cols:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0)
+    out['지급총액_명세'] = out[pay_cols].sum(axis=1)
+    return out
+
+@st.cache_data(show_spinner=False)
+def parse_wage_table(_file):
+    """시급.xlsx 통상시급(2) 시트 → {(고용형태, 호봉번호, 연도): (시급, 통상시급)}"""
+    wb = load_workbook(_file, read_only=True, data_only=True)
+    ws = wb['통상시급 (2)']
+    wage_dict = {}
+    current_type = '정규직'
+    current_grade_num = 0
+
+    for row in ws.iter_rows(values_only=True):
+        full = list(row)
+        r = [v for v in full if v is not None]
+        if not r:
+            continue
+        col2 = full[2] if len(full) > 2 else None
+        col3 = full[3] if len(full) > 3 else None
+        col4 = full[4] if len(full) > 4 else None
+        col5 = full[5] if len(full) > 5 else None
+
+        if col2 and '정규직' in str(col2):
+            current_type = '정규직'; current_grade_num = 0; continue
+        if col2 and '촉탁직' in str(col2):
+            current_type = '촉탁직'; current_grade_num = 0; continue
+        if col2 and '호봉' in str(col2):
+            current_grade_num += 1
+        if col3 and '년도' in str(col3) and col4 and col5:
+            try:
+                year = int(str(col3).replace('년도', ''))
+                key = (current_type, current_grade_num, year)
+                wage_dict[key] = (int(col4), int(col5))
+            except Exception:
+                pass
+    wb.close()
+    # 2025년 = 2024년 값으로 대체
+    for key in list(wage_dict.keys()):
+        t, g, y = key
+        if y == 2024:
+            wage_dict[(t, g, 2025)] = wage_dict[key]
+    return wage_dict
+
+
+def get_tongsigeup(wage_dict, 고용형태, 호봉번호, year):
+    """호봉+연도 → 통상시급 (없으면 가장 가까운 연도 반환)"""
+    key = (고용형태, int(호봉번호), int(year))
+    if key in wage_dict:
+        return wage_dict[key][1]
+    # 연도 fallback: 가장 가까운 연도
+    candidates = [(t, g, y) for (t, g, y) in wage_dict if t == 고용형태 and g == int(호봉번호)]
+    if not candidates:
+        return 0
+    closest = min(candidates, key=lambda k: abs(k[2] - int(year)))
+    return wage_dict[closest][1]
+
+
+def calc_wages_monthly(df_monthly, driver_info_df, wage_dict):
+    """
+    월별 집계 df + 운전자정보 + 시급 →
+    급여 재산정액(A~F) 추가된 df 반환
+    가산율: A×1.0 / B×1.5 / C×0.5 / D×1.5 / E×1.5 / F×2.0
+    """
+    df = df_monthly.copy()
+
+    # 운전자정보 조인 (고용형태, 호봉번호)
+    if driver_info_df is not None and not driver_info_df.empty:
+        info = driver_info_df.copy()
+        info.columns = [c.strip() for c in info.columns]
+        dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
+        info = info.rename(columns={dcol: '운전자'})
+        info['운전자'] = info['운전자'].astype(str).str.strip()
+        df = df.merge(info[['운전자','고용형태','호봉번호']], on='운전자', how='left')
+    else:
+        df['고용형태'] = '정규직'
+        df['호봉번호'] = 1
+
+    df['고용형태'] = df['고용형태'].fillna('정규직')
+    df['호봉번호'] = pd.to_numeric(df['호봉번호'], errors='coerce').fillna(1).astype(int)
+
+    # 연도별 통상시급 조회
+    def get_ts(row):
+        return get_tongsigeup(wage_dict, row['고용형태'], row['호봉번호'], row['연도'])
+
+    df['통상시급'] = df.apply(get_ts, axis=1)
+
+    # 급여 재산정 (분→시간 변환 후 시급 적용)
+    def wage(mins, rate):
+        h = mins / 60.0
+        return round(h * rate)
+
+    ts = df['통상시급']
+    df['W_A_평일8h']     = df['A_평일8h_분'].apply(lambda m: 0)                           + (df['A_평일8h_분'] / 60 * ts).round().astype(int)
+    df['W_B_평일9h상계'] = (df['B_평일9h상계_분'] / 60 * ts * 1.5).round().astype(int)
+    df['W_C_야간']       = (df['C_야간_분']       / 60 * ts * 0.5).round().astype(int)
+    df['W_D_쉬프트단축'] = (df['D_쉬프트단축_분'] / 60 * ts * 1.5).round().astype(int)
+    df['W_E_휴일8h']     = (df['E_휴일8h_분']     / 60 * ts * 1.5).round().astype(int)
+    df['W_F_휴일8h초과'] = (df['F_휴일8h초과_분'] / 60 * ts * 2.0).round().astype(int)
+
+    # 재산정 합계
+    df['재산정_합계'] = (df[['W_A_평일8h','W_B_평일9h상계','W_C_야간',
+                              'W_D_쉬프트단축','W_E_휴일8h','W_F_휴일8h초과']].sum(axis=1))
+    return df
+
+
+def merge_payroll(df_wages, driver_info_df, payroll_df):
+    """재산정 df + 급여명세서 → 차액 계산"""
+    if payroll_df is None or payroll_df.empty:
+        return df_wages
+
+    # 운전자 → 사원번호 매핑
+    if driver_info_df is not None and '사원번호' in driver_info_df.columns:
+        info = driver_info_df.copy()
+        info.columns = [c.strip() for c in info.columns]
+        dcol = next((c for c in ['운전자','이름','성명'] if c in info.columns), info.columns[0])
+        info = info.rename(columns={dcol: '운전자'})
+        info['사원번호'] = info['사원번호'].astype(str).str.strip().str.zfill(7)
+        df = df_wages.merge(info[['운전자','사원번호']], on='운전자', how='left')
+    else:
+        return df_wages  # 사원번호 없으면 스킵
+
+    # 급여명세서 월별 집계 (사원번호+연도+월)
+    pay_agg = payroll_df.groupby(['사원번호','연도','월']).agg(
+        P_기본급=('기본급','sum'),
+        P_연장근로=('연장근로','sum'),
+        P_야간오전=('야간오전','sum'),
+        P_야간오후=('야간오후','sum'),
+        P_주휴수당=('주휴수당','sum'),
+        P_휴일오전=('휴일오전','sum'),
+        P_휴일오후=('휴일오후','sum'),
+        P_경축수당=('경축수당','sum'),
+        P_지급총액=('지급총액_명세','sum'),
+    ).reset_index()
+
+    df = df.merge(pay_agg, on=['사원번호','연도','월'], how='left')
+
+    # 급여 항목 대응 합계
+    df['P_기지급_합계'] = df[['P_기본급','P_연장근로','P_야간오전','P_야간오후',
+                               'P_주휴수당','P_휴일오전','P_휴일오후','P_경축수당']].sum(axis=1)
+
+    # 차액 = 재산정합계 - 기지급합계
+    df['차액'] = df['재산정_합계'] - df['P_기지급_합계']
+    return df
+
+
+
+def generate_report_excel(df_with_wages, df_proc_detail):
+    """
+    개인별 내용증명 양식 Excel 생성
+    시트 구성: [전체(상세)] + [001 운전자명, 002 운전자명, ...]
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import (Font, Alignment, PatternFill,
+                                  Border, Side, numbers)
+    from openpyxl.utils import get_column_letter
+    import io as _io
+
+    wb = Workbook()
+
+    # ── 헬퍼 ──
+    thin = Side(style='thin')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill("solid", fgColor="D9E1F2")
+    hdr_fill2 = PatternFill("solid", fgColor="FCE4D6")
+    bold = Font(bold=True, name='맑은 고딕', size=9)
+    normal = Font(name='맑은 고딕', size=9)
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    right_al = Alignment(horizontal='right', vertical='center')
+    time_fmt = '[h]:mm'
+    won_fmt  = '#,##0;[Red]-#,##0'
+
+    def set_cell(ws, row, col, value, font=None, align=None, fill=None,
+                 border=None, num_format=None):
+        c = ws.cell(row=row, column=col, value=value)
+        if font:      c.font = font
+        if align:     c.alignment = align
+        if fill:      c.fill = fill
+        if border:    c.border = border
+        if num_format: c.number_format = num_format
+        return c
+
+    # ── 1. 전체 상세 시트 ──
+    ws_all = wb.active
+    ws_all.title = '전체'
+
+    detail_cols = ['운행일','회사명','노선','차량번호','운전자',
+                   '운행출발일시','운행종료일시','보정운행시간','야간_분',
+                   '이상값여부','이상값_유형']
+    avail = [c for c in detail_cols if c in df_proc_detail.columns]
+    hdrs  = {'운행일':'운행일','회사명':'회사명','노선':'노선',
+             '차량번호':'차량번호','운전자':'운전자',
+             '운행출발일시':'출발','운행종료일시':'종료',
+             '보정운행시간':'운행시간(분)','야간_분':'야간(분)',
+             '이상값여부':'이상값','이상값_유형':'이상값유형'}
+    for ci, col in enumerate(avail, 1):
+        set_cell(ws_all, 1, ci, hdrs.get(col, col), font=bold,
+                 align=center, fill=hdr_fill, border=border)
+    for ri, (_, row) in enumerate(df_proc_detail[avail].iterrows(), 2):
+        for ci, col in enumerate(avail, 1):
+            set_cell(ws_all, ri, ci, row[col], font=normal, border=border)
+
+    # ── 2. 개인별 시트 ──
+    drivers = sorted(df_with_wages['운전자'].unique())
+
+    # 연월 범위 (2020.01 ~ 최대연도.12)
+    all_years = sorted(df_with_wages['연도'].unique().astype(int))
+    year_range = range(min(all_years), max(all_years) + 1)
+
+    for idx, driver in enumerate(drivers, 1):
+        drv_df = df_with_wages[df_with_wages['운전자'] == driver].copy()
+
+        sheet_name = f"{idx:03d} {driver}"[:31]
+        ws = wb.create_sheet(title=sheet_name)
+
+        # 통상시급 (연도별 대표값 - 해당 연도 첫 번째)
+        ts_by_year = drv_df.groupby('연도')['통상시급'].first().to_dict()
+
+        # ── 헤더 4행 ──
+        # Row 1
+        ws.merge_cells('B1:J1')
+        set_cell(ws, 1, 2, f'{idx:03d}번 원고 {driver}', font=Font(bold=True, size=10, name='맑은 고딕'), align=center)
+        set_cell(ws, 1, 7, '내용증명', font=bold, align=center)
+
+        # Row 2
+        ws.merge_cells('B2:J2')
+        set_cell(ws, 2, 2, '1. (실제 근로시간)', font=bold, align=center, fill=hdr_fill)
+        ws.merge_cells('L2:S2')
+        set_cell(ws, 2, 12, '2. (실제 근로시간에 해당하는 급여 재산정액)', font=bold, align=center, fill=hdr_fill2)
+        set_cell(ws, 2, 20, '통상시급', font=bold, align=center)
+        hdr_fill3 = PatternFill("solid", fgColor="E2EFDA")
+        ws.merge_cells('V2:AB2')
+        set_cell(ws, 2, 22, '3. (실제 지급한 급여명세서)', font=bold, align=center, fill=hdr_fill3)
+        set_cell(ws, 2, 29, '차액(추가지급)', font=bold, align=center)
+
+        # Row 3
+        for col, lbl in [(4,'A'),(5,'B'),(6,'C'),(7,'D'),(9,'E'),(10,'F')]:
+            set_cell(ws, 3, col, lbl, font=bold, align=center, fill=hdr_fill)
+        for col, lbl in [(12,'A'),(13,'B'),(14,'C'),(15,'D'),(17,'E'),(18,'F')]:
+            set_cell(ws, 3, col, lbl, font=bold, align=center, fill=hdr_fill2)
+
+        # Row 4
+        h4 = {2:'년', 3:'월',
+              4:'평일근무\n8시간기준', 5:'평일9시간\n월상계', 6:'야간근무', 7:'쉬프트단축',
+              9:'휴일\n8시간근무', 10:'휴일\n8시간초과',
+              12:'평일근무\n8시간기준', 13:'평일9시간\n월상계', 14:'야근수당',
+              15:'쉬프트단축', 17:'휴일근무\n8시간', 18:'휴일근무\n8시간초과',
+              20:'통상시급(원)',
+              22:'기본급', 23:'연장근로', 24:'야간오전', 25:'야간오후',
+              26:'휴일오전', 27:'휴일오후', 29:'차액(+추가지급)'}
+        for col, lbl in h4.items():
+            if col <= 10:      fill = hdr_fill
+            elif col <= 18:    fill = hdr_fill2
+            elif col <= 27:    fill = hdr_fill3 if 'hdr_fill3' in dir() else None
+            else:              fill = None
+            set_cell(ws, 4, col, lbl, font=bold, align=center, fill=fill, border=border)
+
+        # Row 5 (배율)
+        for col, lbl in [(12,'×1.0'),(13,'×1.5'),(14,'×0.5'),(15,'×1.5'),(17,'×1.5'),(18,'×2.0')]:
+            set_cell(ws, 5, col, lbl, font=bold, align=center, fill=hdr_fill2, border=border)
+
+        # ── 데이터 행 ──
+        row_num = 6
+        prev_year = None
+
+        for year in year_range:
+            for month in range(1, 13):
+                sub = drv_df[(drv_df['연도'] == year) & (drv_df['월'] == month)]
+
+                if sub.empty:
+                    A_min = B_min = C_min = D_min = E_min = F_min = 0
+                    wA = wB = wC = wD = wE = wF = 0
+                    ts_val = ts_by_year.get(year, 0)
+                else:
+                    r = sub.iloc[0]
+                    A_min = float(r.get('A_평일8h_분', 0) or 0)
+                    B_min = float(r.get('B_평일9h상계_분', 0) or 0)
+                    C_min = float(r.get('C_야간_분', 0) or 0)
+                    D_min = float(r.get('D_쉬프트단축_분', 0) or 0)
+                    E_min = float(r.get('E_휴일8h_분', 0) or 0)
+                    F_min = float(r.get('F_휴일8h초과_분', 0) or 0)
+                    wA = int(r.get('W_A_평일8h', 0) or 0)
+                    wB = int(r.get('W_B_평일9h상계', 0) or 0)
+                    wC = int(r.get('W_C_야간', 0) or 0)
+                    wD = int(r.get('W_D_쉬프트단축', 0) or 0)
+                    wE = int(r.get('W_E_휴일8h', 0) or 0)
+                    wF = int(r.get('W_F_휴일8h초과', 0) or 0)
+                    ts_val = int(r.get('통상시급', 0) or 0)
+
+                # 연도는 첫 달에만 표시
+                yr_val = year if prev_year != year else None
+                set_cell(ws, row_num, 2, yr_val, font=normal, align=center, border=border)
+                set_cell(ws, row_num, 3, month, font=normal, align=center, border=border)
+
+                # 시간 컬럼 (분 → Excel 시간값 = 분/60/24)
+                for col, mins in [(4, A_min),(5, B_min),(6, C_min),(7, D_min),
+                                   (9, E_min),(10, F_min)]:
+                    val = mins / 60.0 / 24.0  # Excel time fraction
+                    c = set_cell(ws, row_num, col, val, font=normal,
+                                 align=center, border=border, num_format=time_fmt)
+
+                # 급여 컬럼
+                for col, won in [(12, wA),(13, wB),(14, wC),(15, wD),(17, wE),(18, wF)]:
+                    set_cell(ws, row_num, col, won, font=normal,
+                             align=right_al, border=border, num_format=won_fmt)
+
+                # 통상시급
+                set_cell(ws, row_num, 20, ts_val, font=normal,
+                         align=right_al, border=border, num_format='#,##0')
+
+                # 3. 기지급 급여명세서
+                if 'P_기본급' in (sub.columns if not sub.empty else []):
+                    pay_row = sub.iloc[0] if not sub.empty else None
+                    for col, key in [(22,'P_기본급'),(23,'P_연장근로'),
+                                     (24,'P_야간오전'),(25,'P_야간오후'),
+                                     (26,'P_휴일오전'),(27,'P_휴일오후')]:
+                        val = int(pay_row[key]) if (pay_row is not None and key in pay_row.index and pd.notna(pay_row[key])) else 0
+                        set_cell(ws, row_num, col, val, font=normal,
+                                 align=right_al, border=border, num_format=won_fmt)
+                    # 차액
+                    diff = int(pay_row['차액']) if (pay_row is not None and '차액' in pay_row.index and pd.notna(pay_row['차액'])) else 0
+                    diff_font = Font(name='맑은 고딕', size=9, color='FF0000' if diff > 0 else '000000', bold=diff != 0)
+                    set_cell(ws, row_num, 29, diff, font=diff_font,
+                             align=right_al, border=border, num_format=won_fmt)
+
+                prev_year = year
+                row_num += 1
+
+        # 열 너비
+        col_widths = {2:6, 3:4, 4:10, 5:10, 6:9, 7:9, 8:1, 9:9, 10:9, 11:1,
+                      12:11, 13:11, 14:9, 15:9, 16:1, 17:11, 18:11, 20:10}
+        for col, w in col_widths.items():
+            ws.column_dimensions[get_column_letter(col)].width = w
+        ws.row_dimensions[4].height = 36
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 def to_excel(df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -640,6 +1017,33 @@ with st.sidebar:
     extra_min = st.slider("인가시간 초과 허용 (분)", 0, 120, 60,
                           help="인가운행시간 + 이 값 초과 시 이상값 처리")
     st.caption(f"예: 2016노선(245분) → 상한 {245+extra_min}분")
+
+    uploaded_wage = st.file_uploader(
+        "④ 시급 파일 (xlsx)",
+        type=["xlsx"], key="wage"
+    )
+    uploaded_drv_info = st.file_uploader(
+        "⑤ 운전자 호봉·사번 정보 (CSV)",
+        type=["csv"], key="drv_info"
+    )
+    uploaded_payroll = st.file_uploader(
+        "⑥ 급여명세서 (xlsx, xlsb→xlsx 변환 후)",
+        type=["xlsx"], key="payroll"
+    )
+
+    # 운전자 호봉 템플릿
+    tmpl_drv = pd.DataFrame({
+        "운전자":   ["홍길동", "김철수"],   # 운행데이터 운전자명 (정확히 일치해야 함)
+        "사원번호": ["0000121", "0000300"], # 급여명세서 사원번호
+        "성명":     ["홍길동", "김철수"],   # 급여명세서 성명
+        "고용형태": ["정규직", "촉탁직"],
+        "호봉번호": [3, 1],
+    })
+    st.download_button(
+        "📥 운전자 호봉 템플릿",
+        ("﻿" + tmpl_drv.to_csv(index=False)).encode("utf-8"),
+        "운전자_호봉_템플릿.csv", "text/csv"
+    )
 
     st.markdown("---")
     st.caption("📌 000000 미등록 운전자는 포함 처리 (추후 역추적 등록 예정)")
@@ -711,6 +1115,39 @@ if uploaded_hol:
     if "지정휴일2" in hol.columns:
         hol["지정휴일2"] = hol["지정휴일2"].map(WEEKDAY_MAP).fillna(6).astype(int)
     driver_hol_df = hol
+
+# ─── 시급 / 운전자 호봉 정보 로딩 ───
+# ─── 급여명세서 로딩 ───
+payroll_df = None
+if uploaded_payroll:
+    try:
+        payroll_df = load_payroll(uploaded_payroll)
+        if payroll_df.empty:
+            st.sidebar.warning("급여명세서 파일에서 데이터를 읽지 못했습니다.")
+    except Exception as e:
+        st.sidebar.warning(f"급여명세서 로드 실패: {e}")
+
+wage_dict = {}
+if uploaded_wage:
+    try:
+        wage_dict = parse_wage_table(uploaded_wage)
+    except Exception as e:
+        st.sidebar.warning(f"시급 파일 로드 실패: {e}")
+
+driver_info_df = None
+if uploaded_drv_info:
+    raw_di = uploaded_drv_info.read()
+    if raw_di.startswith(b'\xef\xbb\xbf'): raw_di = raw_di[3:]
+    _di = None
+    for enc in ["utf-8","cp949","euc-kr","latin-1"]:
+        try: _di = pd.read_csv(io.StringIO(raw_di.decode(enc))); break
+        except: continue
+    if _di is not None:
+        _di.columns = [c.strip() for c in _di.columns]
+        dcol = next((c for c in ['운전자','이름','성명'] if c in _di.columns), _di.columns[0])
+        _di = _di.rename(columns={dcol: '운전자'})
+        _di['운전자'] = _di['운전자'].astype(str).str.strip()
+        driver_info_df = _di
 
 # ─── 처리 ───
 with st.spinner("⚙️ 이상값 탐지 및 보정 중..."):
@@ -988,7 +1425,7 @@ with tab_labor:
     with dl1:
         st.download_button(
             "📥 일별 상세 (전체)",
-            to_excel(show_daily),
+            to_excel(show_daily_raw),
             f"근로시간재산정_일별_{sel_ly}{str(sel_lm).zfill(2)}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_labor_daily"
@@ -1002,7 +1439,49 @@ with tab_labor:
             key="dl_labor_monthly"
         )
 
-    if not driver_hol_df is not None:
+    st.markdown("---")
+    st.subheader("📄 내용증명 양식 Excel 생성 (개인별 시트)")
+
+    if not wage_dict:
+        st.warning("⬅️ 사이드바에서 **④ 시급 파일**을 업로드하면 급여 재산정액까지 포함된 내용증명 Excel을 생성할 수 있습니다.")
+    else:
+        if driver_info_df is None:
+            st.info("💡 **⑤ 운전자 호봉 정보** 파일이 없으면 전원 정규직 1호봉으로 계산됩니다.")
+
+        # 필터 옵션
+        ec1, ec2 = st.columns(2)
+        sel_report_drivers = ec1.multiselect(
+            "생성할 운전자 선택 (비워두면 전원)",
+            options=sorted(df_monthly_labor["운전자"].unique()),
+            key="report_drivers"
+        )
+
+        if st.button("📄 내용증명 Excel 생성", type="primary", key="gen_report"):
+            with st.spinner("Excel 생성 중... (운전자 수에 따라 1~2분 소요)"):
+                # 급여 계산
+                df_wages = calc_wages_monthly(df_monthly_labor, driver_info_df, wage_dict)
+
+                # 급여명세서 차액 합산
+                if payroll_df is not None:
+                    df_wages = merge_payroll(df_wages, driver_info_df, payroll_df)
+
+                # 운전자 필터
+                if sel_report_drivers:
+                    df_wages = df_wages[df_wages["운전자"].isin(sel_report_drivers)]
+
+                # Excel 생성
+                excel_bytes = generate_report_excel(df_wages, df_proc)
+
+            st.success(f"✅ {df_wages['운전자'].nunique():,}명 × 연도별 월간 집계 완료!")
+            st.download_button(
+                "💾 내용증명 Excel 다운로드",
+                excel_bytes,
+                "내용증명_근로시간재산정.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_report"
+            )
+
+    if driver_hol_df is None:
         st.info("💡 지정휴일 파일을 업로드하면 운전자별 지정휴일이 '휴일'로 정확히 분류됩니다.")
 
 
