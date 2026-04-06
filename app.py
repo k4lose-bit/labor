@@ -522,15 +522,17 @@ def classify_work_hours(df_proc, driver_hol_df):
                     "A_평일8h": 0.0,
                     "B_평일9h상계": 0.0,
                     "C_야간": night,
-                    "D_쉬프트단축": t - 300.0,   # 음수=미달, 양수=초과
+                    "C_야간상계": night - 300.0,  # 기지급 5h(300분) 차감
+                    "D_쉬프트단축": t - 300.0,    # 음수=미달, 양수=초과
                     "E_휴일8h": 0.0,
                     "F_휴일8h초과": 0.0,
                 })
             else:
                 return pd.Series({
                     "A_평일8h": min(t, 480.0),
-                    "B_평일9h상계": t - 540.0,    # 음수=미달, 양수=초과
+                    "B_평일9h상계": t - 540.0,     # 음수=미달, 양수=초과
                     "C_야간": night,
+                    "C_야간상계": night - 300.0,    # 기지급 5h(300분) 차감
                     "D_쉬프트단축": 0.0,
                     "E_휴일8h": 0.0,
                     "F_휴일8h초과": 0.0,
@@ -550,15 +552,38 @@ def monthly_work_summary(df_cls):
         A_평일8h_분=("A_평일8h", "sum"),
         B_평일9h상계_분=("B_평일9h상계", "sum"),
         C_야간_분=("C_야간", "sum"),
+        C_야간상계_분=("C_야간상계", "sum"),
         D_쉬프트단축_분=("D_쉬프트단축", "sum"),
         E_휴일8h_분=("E_휴일8h", "sum"),
         F_휴일8h초과_분=("F_휴일8h초과", "sum"),
     ).reset_index()
 
-    for col in ["A_평일8h", "B_평일9h상계", "C_야간", "D_쉬프트단축", "E_휴일8h", "F_휴일8h초과"]:
+    for col in ["A_평일8h", "B_평일9h상계", "C_야간", "C_야간상계", "D_쉬프트단축", "E_휴일8h", "F_휴일8h초과"]:
         grp[f"{col}_시간"] = (grp[f"{col}_분"] / 60).round(2)
 
     return grp
+
+
+def mins_to_hhmm(mins):
+    """분(float) → 'HH:MM' 문자열. 음수는 '-HH:MM'"""
+    try:
+        m = float(mins)
+        sign = "-" if m < 0 else ""
+        m = abs(m)
+        h = int(m // 60)
+        mi = int(round(m % 60))
+        return f"{sign}{h:02d}:{mi:02d}"
+    except:
+        return "00:00"
+
+
+def df_to_hhmm(df, cols):
+    """지정 컬럼들을 분→HH:MM 으로 변환한 복사본 반환"""
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = out[c].apply(mins_to_hhmm)
+    return out
 
 def to_excel(df):
     buf = io.BytesIO()
@@ -889,23 +914,30 @@ with tab_labor:
 
     # ── 일별 상세 ──
     st.markdown("#### 📋 일별 근로시간 분류 (분 단위)")
-    show_daily = filt_cls[[
-        "운행일","운전자","휴일여부","쉬프트유형","총시간_분","야간_분",
-        "A_평일8h","B_평일9h상계","C_야간","D_쉬프트단축","E_휴일8h","F_휴일8h초과"
-    ]].copy()
-    show_daily.columns = [
-        "날짜","운전자","휴일","쉬프트","총시간(분)","야간(분)",
-        "A.평일8h","B.평일9h상계","C.야간","D.쉬프트단축","E.휴일8h","F.휴일8h초과"
-    ]
-    # 음수값 강조 표시를 위한 스타일
+    # 음수값 강조 표시
     def highlight_neg(val):
-        if isinstance(val, (int, float)) and val < 0:
+        if isinstance(val, str) and val.startswith("-"):
             return "color: red"
         return ""
+
+    show_daily_raw = filt_cls[[
+        "운행일","운전자","휴일여부","쉬프트유형",
+        "총시간_분","A_평일8h","B_평일9h상계",
+        "C_야간","C_야간상계","D_쉬프트단축","E_휴일8h","F_휴일8h초과"
+    ]].copy()
+    # 분 → HH:MM 변환
+    time_cols_d = ["총시간_분","A_평일8h","B_평일9h상계",
+                   "C_야간","C_야간상계","D_쉬프트단축","E_휴일8h","F_휴일8h초과"]
+    show_daily = df_to_hhmm(show_daily_raw, time_cols_d)
+    show_daily.columns = [
+        "날짜","운전자","휴일","쉬프트",
+        "총시간","A.평일8h","B.평일9h상계",
+        "C.야간","C.야간상계(기5h차감)","D.쉬프트단축","E.휴일8h","F.휴일8h초과"
+    ]
     st.dataframe(
         show_daily.sort_values(["운전자","날짜"]).reset_index(drop=True)
                   .style.map(highlight_neg,
-                    subset=["B.평일9h상계","D.쉬프트단축"]),
+                    subset=["B.평일9h상계","C.야간상계(기5h차감)","D.쉬프트단축"]),
         use_container_width=True, hide_index=True
     )
 
@@ -915,19 +947,23 @@ with tab_labor:
     st.markdown("#### 📊 월별 개인별 근로시간 합계 (시간 단위)")
     st.caption("B·D 항목은 음수=기준 미달(임금 과지급 가능), 양수=기준 초과(추가 임금 발생)")
 
-    show_mo = filt_mo[[
+    show_mo_raw = filt_mo[[
         "운전자","근무일수","정상일수","단축일수","휴일일수",
-        "A_평일8h_시간","B_평일9h상계_시간","C_야간_시간",
-        "D_쉬프트단축_시간","E_휴일8h_시간","F_휴일8h초과_시간"
+        "A_평일8h_분","B_평일9h상계_분","C_야간_분","C_야간상계_분",
+        "D_쉬프트단축_분","E_휴일8h_분","F_휴일8h초과_분"
     ]].copy()
+    time_cols_m = ["A_평일8h_분","B_평일9h상계_분","C_야간_분","C_야간상계_분",
+                   "D_쉬프트단축_분","E_휴일8h_분","F_휴일8h초과_분"]
+    show_mo = df_to_hhmm(show_mo_raw, time_cols_m)
     show_mo.columns = [
         "운전자","근무일","정상일","단축일","휴일일",
-        "A.평일8h","B.평일9h상계","C.야간",
+        "A.평일8h","B.평일9h상계","C.야간","C.야간상계(기5h차감)",
         "D.쉬프트단축","E.휴일8h","F.휴일8h초과"
     ]
     st.dataframe(
         show_mo.sort_values("운전자").reset_index(drop=True)
-               .style.map(highlight_neg, subset=["B.평일9h상계","D.쉬프트단축"]),
+               .style.map(highlight_neg,
+                 subset=["B.평일9h상계","C.야간상계(기5h차감)","D.쉬프트단축"]),
         use_container_width=True, hide_index=True
     )
 
