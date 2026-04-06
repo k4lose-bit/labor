@@ -244,7 +244,8 @@ def load_operation_files(file_list):
     errors = []
     for f in file_list:
         try:
-            df = pd.read_excel(f, header=2)
+            f.seek(0)
+            df = pd.read_excel(io.BytesIO(f.read()), header=2)
             df = df.dropna(subset=["운행일"])
             dfs.append(df)
         except Exception as ex:
@@ -272,7 +273,8 @@ def load_operation_files(file_list):
 @st.cache_data(show_spinner=False)
 def load_route_ref(file):
     """인가현황 파일 → 노선별 인가운행시간 참조 테이블"""
-    df = pd.read_excel(file, header=2)
+    file.seek(0)
+    df = pd.read_excel(io.BytesIO(file.read()), header=2)
     df = df.dropna(subset=["노선"])
     df = df.rename(columns={"운행시간": "인가운행시간", "적용년": "연도"})
     df["노선"] = df["노선"].astype(str).str.strip()
@@ -604,7 +606,8 @@ def load_payroll(_file):
           연장근로, 야간오전, 야간오후, 휴일오전, 휴일오후,
           경축수당, 심야수당, 지급총액
     """
-    xl = pd.ExcelFile(_file)
+    _file.seek(0)
+    xl = pd.ExcelFile(io.BytesIO(_file.read()))
     dfs = []
     for sheet in xl.sheet_names:
         try:
@@ -636,7 +639,8 @@ def load_payroll(_file):
 @st.cache_data(show_spinner=False)
 def parse_wage_table(_file):
     """시급.xlsx 통상시급(2) 시트 → {(고용형태, 호봉번호, 연도): (시급, 통상시급)}"""
-    wb = load_workbook(_file, read_only=True, data_only=True)
+    _file.seek(0)   # 파일 포인터 초기화
+    wb = load_workbook(io.BytesIO(_file.read()), read_only=True, data_only=True)
     ws = wb['통상시급 (2)']
     wage_dict = {}
     current_type = '정규직'
