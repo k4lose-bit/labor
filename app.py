@@ -409,7 +409,7 @@ with st.sidebar:
     })
     st.download_button(
         "📥 지정휴일 템플릿",
-        tmpl.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        ("\ufeff" + tmpl.to_csv(index=False)).encode("utf-8"),
         "지정휴일_템플릿.csv", "text/csv"
     )
 
@@ -472,8 +472,10 @@ if uploaded_route:
 
 driver_hol_df = None
 if uploaded_hol:
-    content = uploaded_hol.read().decode("utf-8-sig")
-    hol = pd.read_csv(io.StringIO(content))
+    raw = uploaded_hol.read()
+    if raw.startswith(b'\xef\xbb\xbf'):  # BOM 수동 제거 (Python 3.14 utf-8-sig 버그 우회)
+        raw = raw[3:]
+    hol = pd.read_csv(io.StringIO(raw.decode("utf-8")))
     # 요일명 → 숫자
     if "지정휴일1" in hol.columns:
         hol["지정휴일1"] = hol["지정휴일1"].map(WEEKDAY_MAP).fillna(5).astype(int)
