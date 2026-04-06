@@ -398,19 +398,35 @@ def calc_mangeun(year, month, hd1, hd2):
 
 def monthly_attendance(df_daily, driver_hol_df, year, month):
     """월별 운전자별 근무일수 + 만근일수 테이블"""
-    # 근무일수
     sub = df_daily[(df_daily["연도"] == year) & (df_daily["월"] == month)]
     wdays = sub.groupby("운전자")["운행일_dt"].nunique().reset_index()
     wdays.columns = ["운전자", "근무일수"]
-    wdays["총운행시간_시간"] = sub.groupby("운전자")["총운행시간_시간"].sum().values
+    time_sum = sub.groupby("운전자")["총운행시간_시간"].sum().reset_index()
+    wdays = wdays.merge(time_sum, on="운전자", how="left")
 
     if driver_hol_df is None or driver_hol_df.empty:
         wdays["만근일수"] = "─"
         wdays["초과/미달"] = "─"
         return wdays
 
+    # 컬럼명 공백/BOM 제거 (CSV 저장 방식에 따라 컬럼명에 공백이 붙을 수 있음)
+    hol_df = driver_hol_df.copy()
+    hol_df.columns = [c.strip() for c in hol_df.columns]
+
+    # 운전자 컬럼명 자동 탐지 (운전자 / 이름 / name 등 허용)
+    driver_col = None
+    for cand in ["운전자", "이름", "성명", "name", "driver"]:
+        if cand in hol_df.columns:
+            driver_col = cand
+            break
+    if driver_col is None:
+        driver_col = hol_df.columns[0]  # 첫 번째 컬럼을 운전자로 간주
+
+    hol_df = hol_df.rename(columns={driver_col: "운전자"})
+    hol_df["운전자"] = hol_df["운전자"].astype(str).str.strip()
+
     rows = []
-    for _, drow in driver_hol_df.iterrows():
+    for _, drow in hol_df.iterrows():
         driver = drow["운전자"]
         hd1 = int(drow.get("지정휴일1", 5))
         hd2 = int(drow.get("지정휴일2", 6))
@@ -418,7 +434,10 @@ def monthly_attendance(df_daily, driver_hol_df, year, month):
         rows.append({"운전자": driver, **mg})
     mg_df = pd.DataFrame(rows)
 
-    result = wdays.merge(mg_df[["운전자", "달력일수", "지정휴일수", "비중복_공휴일수", "만근일수"]], on="운전자", how="left")
+    result = wdays.merge(
+        mg_df[["운전자", "달력일수", "지정휴일수", "비중복_공휴일수", "만근일수"]],
+        on="운전자", how="left"
+    )
     result["초과/미달"] = result["근무일수"] - result["만근일수"].fillna(0)
     return result
 
